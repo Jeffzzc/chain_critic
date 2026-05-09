@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=7 swift infer \
+  --model /data/dhf/chain_critic/output/v0-20260316-153142/checkpoint-14000 \
+  --infer_backend transformers \
+  --val_dataset /data/dhf/chain_critic/datasets/train/single_dim_sft_test.jsonl \
+  --template qwen2_5 \
+  --max_length 4096 \
+  --stream false \
+  --temperature 0 \
+  --max_new_tokens 2048 \
+  --max_batch_size 2 \
+  --val_dataset_sample 100 \
+  --result_path /data/dhf/chain_critic/output/v0-20260316-153142/checkpoint-14000_test100_pred.jsonl
