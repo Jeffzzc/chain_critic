@@ -34,6 +34,7 @@ SYSTEM_PROMPT = (
     "dimensions with their full-score criteria, and a target overall score from 0 to 4. "
     "Generate one realistic answer that would receive exactly that overall score when "
     "judged jointly across all dimensions. Then produce one concise overall reason and "
+    "executable revision_suggestions for fixing the weaknesses, plus "
     "one revised answer that clearly fixes the weaknesses and satisfies the dimensions "
     "well. Return strict JSON only."
 )
@@ -50,10 +51,11 @@ USER_TEMPLATE = (
     "4. Keep the answer relevant to the question.\n"
     "5. Write one concise overall reason explaining why the generated answer deserves the target score.\n"
     "6. The reason must integrate all important dimensions instead of listing disconnected fragments.\n"
-    "7. Also generate a modified answer that clearly improves the generated answer and aims to satisfy the dimensions jointly.\n"
-    "8. The modified answer must stay on-task, complete the reasoning, and avoid mentioning the rubric, target score, or evaluation process.\n"
-    "9. Return JSON only with this schema:\n"
-    "{{\"average_score\": {target_score}, \"reason\": \"...\", \"generated_answer\": \"...\", \"modified_answer\": \"...\"}}"
+    "7. Generate revision_suggestions as concrete edit instructions for moving the generated answer to full score.\n"
+    "8. Also generate a modified answer that clearly improves the generated answer and aims to satisfy the dimensions jointly.\n"
+    "9. The modified answer must stay on-task, complete the reasoning, and avoid mentioning the rubric, target score, or evaluation process.\n"
+    "10. Return JSON only with this schema:\n"
+    "{{\"average_score\": {target_score}, \"reason\": \"...\", \"revision_suggestions\": \"...\", \"generated_answer\": \"...\", \"modified_answer\": \"...\"}}"
 )
 
 
@@ -173,6 +175,15 @@ def normalize_generation_payload(
         api_base.get_payload_value(parsed, "generated_answer", "answer")
     )
     reason = _normalize_text(api_base.get_payload_value(parsed, "reason", "Reason"))
+    revision_suggestions = _normalize_text(
+        api_base.get_payload_value(
+            parsed,
+            "revision_suggestions",
+            "edit_intent",
+            "Revision Suggestions",
+            "Edit Intent",
+        )
+    )
     modified_answer = _normalize_text(
         api_base.get_payload_value(
             parsed,
@@ -184,6 +195,7 @@ def normalize_generation_payload(
     if (
         base._is_empty(generated_answer)
         or base._is_empty(reason)
+        or base._is_empty(revision_suggestions)
         or base._is_empty(modified_answer)
     ):
         return None
@@ -191,6 +203,7 @@ def normalize_generation_payload(
     return {
         "average_score": parsed_score,
         "reason": reason,
+        "revision_suggestions": revision_suggestions,
         "generated_answer": generated_answer,
         "modified_answer": modified_answer,
     }
@@ -276,6 +289,8 @@ def write_score5_rows(
                 "evaluation_dimensions": seed["evaluation_dimensions"],
                 "average_score": 5,
                 "reason": build_score5_reason(seed=seed, reason_lookup=reason_lookup),
+                "revision_suggestions": "No revision is needed because the answer is already treated as the full-score reference.",
+                "edit_intent": "No revision is needed because the answer is already treated as the full-score reference.",
                 "modified_answer": seed["answer"],
             }
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -334,6 +349,8 @@ async def worker(
                     "evaluation_dimensions": record.get("evaluation_dimensions"),
                     "average_score": normalized_payload["average_score"],
                     "reason": normalized_payload["reason"],
+                    "revision_suggestions": normalized_payload["revision_suggestions"],
+                    "edit_intent": normalized_payload["revision_suggestions"],
                     "modified_answer": normalized_payload["modified_answer"],
                     "source_answer": record.get("answer"),
                     # "raw_response": raw_text,

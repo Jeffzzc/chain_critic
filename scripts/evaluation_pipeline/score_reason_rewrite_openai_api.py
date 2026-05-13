@@ -56,7 +56,10 @@ DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"
 
 SCORE_LINE_RE = re.compile(rf"(?im)^\s*score\s*{COLON_CLASS}\s*([0-5])\s*$")
 REASON_RE = re.compile(
-    rf"(?is)reason\s*{COLON_CLASS}\s*(.*?)\s*(?:(?:\n\s*)?(?:modified answer|revised answer)\s*{COLON_CLASS}|$)"
+    rf"(?is)reason\s*{COLON_CLASS}\s*(.*?)\s*(?:(?:\n\s*)?(?:revision suggestions|edit intent|modified answer|revised answer)\s*{COLON_CLASS}|$)"
+)
+REVISION_RE = re.compile(
+    rf"(?is)(?:revision suggestions|edit intent)\s*{COLON_CLASS}\s*(.*?)\s*(?:(?:\n\s*)?(?:modified answer|revised answer)\s*{COLON_CLASS}|$)"
 )
 MODIFIED_RE = re.compile(rf"(?is)(?:modified answer|revised answer)\s*{COLON_CLASS}\s*(.*)$")
 
@@ -68,8 +71,9 @@ SYSTEM_PROMPT = (
     "Do not introduce unsupported facts. If the question is underspecified, make the "
     "minimum necessary assumption explicit.\n"
     "Return strict JSON only, with this exact schema:\n"
-    '{"score": 1, "reason": "...", "modified_answer": "..."}\n'
+    '{"score": 1, "reason": "...", "revision_suggestions": "...", "modified_answer": "..."}\n'
     "The score must be an integer within the provided score range. The reason must be concise and based on the rubric. "
+    "The revision_suggestions field must give executable edits that directly address the stated problems. "
     "The modified_answer must be a complete improved answer to the question."
 )
 
@@ -174,20 +178,30 @@ def parse_model_output(text: str) -> dict[str, Any]:
     if parsed is not None:
         score = parse_int_score(parsed.get("score"))
         reason = normalize_text(parsed.get("reason"))
+        revision_suggestions = normalize_text(
+            parsed.get("revision_suggestions")
+            or parsed.get("edit_intent")
+            or parsed.get("Revision Suggestions")
+            or parsed.get("Edit Intent")
+        )
         modified_answer = normalize_text(
             parsed.get("modified_answer") or parsed.get("revised_answer") or parsed.get("better_answer")
         )
         return {
             "score": score,
             "reason": reason,
+            "revision_suggestions": revision_suggestions,
             "modified_answer": modified_answer,
             "raw_output": raw_text,
-            "parse_error": None if score is not None else "Failed to parse JSON score.",
-            "strict_json_ok": score is not None and bool(reason) and bool(modified_answer),
+            "parse_error": None
+            if score is not None and reason and revision_suggestions and modified_answer
+            else "Parsed JSON but some required fields are missing.",
+            "strict_json_ok": score is not None and bool(reason) and bool(revision_suggestions) and bool(modified_answer),
         }
 
     score: int | None = None
     reason = ""
+    revision_suggestions = ""
     modified_answer = ""
     parse_error: str | None = None
 
@@ -202,15 +216,19 @@ def parse_model_output(text: str) -> dict[str, Any]:
             parse_error = "Failed to parse score."
 
     reason_match = REASON_RE.search(raw_text)
+    revision_match = REVISION_RE.search(raw_text)
     modified_match = MODIFIED_RE.search(raw_text)
     if reason_match:
         reason = normalize_text(reason_match.group(1))
+    if revision_match:
+        revision_suggestions = normalize_text(revision_match.group(1))
     if modified_match:
         modified_answer = normalize_text(modified_match.group(1))
 
     return {
         "score": score,
         "reason": reason,
+        "revision_suggestions": revision_suggestions,
         "modified_answer": modified_answer,
         "raw_output": raw_text,
         "parse_error": parse_error,
@@ -311,7 +329,8 @@ def build_user_prompt(
         "Tasks:\n"
         f"1. Assign one integer score from {score_range_label} to the candidate answer.\n"
         "2. Give a concise reason grounded in the score criteria.\n"
-        "3. Rewrite a better answer to the original question that would satisfy the dimension better.\n\n"
+        "3. Give executable revision suggestions that directly state how to fix the answer.\n"
+        "4. Rewrite a better answer to the original question that would satisfy the dimension better.\n\n"
         "Return strict JSON only."
     )
 
@@ -407,6 +426,8 @@ def run_one(
         "criteria_text": sample["criteria_text"],
         "predicted_score": None,
         "predicted_reason": "",
+        "revision_suggestions": "",
+        "edit_intent": "",
         "predicted_modified_answer": "",
         "raw_output": "",
         "ok": False,
@@ -435,11 +456,18 @@ def run_one(
         parse_error = parsed["parse_error"]
         if parsed["score"] is not None and not score_in_range:
             parse_error = f"Score {parsed['score']} is outside allowed range {sorted(allowed_scores)}."
-        ok = score_in_range and bool(parsed["reason"]) and bool(parsed["modified_answer"])
+        ok = (
+            score_in_range
+            and bool(parsed["reason"])
+            and bool(parsed["revision_suggestions"])
+            and bool(parsed["modified_answer"])
+        )
         row.update(
             {
                 "predicted_score": parsed["score"],
                 "predicted_reason": parsed["reason"],
+                "revision_suggestions": parsed["revision_suggestions"],
+                "edit_intent": parsed["revision_suggestions"],
                 "predicted_modified_answer": parsed["modified_answer"],
                 "raw_output": parsed["raw_output"],
                 "ok": ok,

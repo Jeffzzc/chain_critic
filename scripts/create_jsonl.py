@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Build SFT jsonl from single_dim iteration outputs.
+"""Build SFT jsonl for score+reason+revision training.
 
 Target message format:
 {
@@ -10,10 +10,10 @@ Target message format:
   ]
 }
 
-Each input sample is expanded by dimension:
+Each input sample is expanded by dimension when per-dimension results exist:
 - one row with N dimensions -> N training items
-- user: instruction + Q + A + single dimension + dimension criteria
-- assistant: score + reason + modified answer
+- user: instruction + Q + A + single dimension + complete 0-5 score criteria
+- assistant: score + reason + revision_suggestions + modified answer
 
 Edit prompts below directly when you need a new dataset prompt style.
 """
@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,9 +32,9 @@ from typing import Any
 # ===================== Editable config =====================
 INPUT_ROOT = Path("datasets/filled_iteration_train_outputs/datasets")
 DIMENSIONS_ROOT = Path("datasets")
-OUTPUT_JSONL = Path("datasets/filled_iteration_train_outputs/single_dim_sft.jsonl")
-OUTPUT_TRAIN_JSONL = Path("datasets/filled_iteration_train_outputs/single_dim_sft_train.jsonl")
-OUTPUT_TEST_JSONL = Path("datasets/filled_iteration_train_outputs/single_dim_sft_test.jsonl")
+OUTPUT_JSONL = Path("datasets/filled_iteration_train_outputs/score_reason_revision_sft.jsonl")
+OUTPUT_TRAIN_JSONL = Path("datasets/filled_iteration_train_outputs/score_reason_revision_sft_train.jsonl")
+OUTPUT_TEST_JSONL = Path("datasets/filled_iteration_train_outputs/score_reason_revision_sft_test.jsonl")
 SINGLE_DIM_DIR_NAME = "single_dim"
 DIMENSIONS_DIR_NAME = "dimensions"
 # test : train = 1 : 50
@@ -42,38 +43,51 @@ TEST_RATIO = 1 / 51
 SPLIT_SEED = 42
 SHUFFLE_BEFORE_SPLIT = True
 
-SYSTEM_PROMPT = "You are an AI evaluator-and-rewriter. Your task is to evaluate and then repair the answer using ONLY the provided evaluation dimension and its full-score criteria. Return plain text in exactly this 3-line format: 1) Score: <number in [0,5], decimals allowed> 2) Reason: <concise explanation strictly under the given dimension criteria> 3) Modified Answer: <revised answer optimized ONLY for the given dimension criteria, without unsupported facts; if needed, state minimal assumptions explicitly>."
+SYSTEM_PROMPT = (
+    "You are an expert evaluator and answer rewriter. Evaluate a candidate answer "
+    "to a given question under the specified evaluation dimension and 0-5 scoring "
+    "criteria. Identify its strengths, errors, missing parts, and why it does or does "
+    "not meet the highest-score criterion. Then provide actionable revision suggestions "
+    "and rewrite the answer into a stronger response optimized for the same dimension. "
+    "Use only the provided question, candidate answer, evaluation dimension, and scoring "
+    "criteria. Do not add unsupported facts. Return strict JSON only, with exactly these "
+    "keys: score, reason, revision_suggestions, modified_answer."
+)
 
 USER_TASK_INSTRUCTION = (
-    "###Task Description:\n"
-    "You are given a question, a response to evaluate, and one evaluation "
-    "dimension with its full-score criteria.\n"
-    "1. Write feedback that assesses the quality of the response strictly "
-    "based on the given dimension criteria.\n"
-    "2. After the feedback, write a score that reflects how well the response "
-    "satisfies the criteria.\n"
-    "3. Then rewrite the answer so it better satisfies the criteria, without "
-    "adding unsupported facts.\n"
-    "4. The output format must be exactly:\n"
-    "Score: <score>\n"
-    "Reason: <feedback>\n"
-    "Modified Answer: <rewritten answer>\n"
-    "5. Do not generate any other opening, closing, JSON, or explanations."
+    "### Task Description:\n"
+    "You are given a question, a candidate answer, one evaluation dimension, "
+    "and the complete 0-5 scoring criteria for that dimension.\n"
+    "\n"
+    "Your task is to evaluate and improve the candidate answer using only the provided "
+    "question, candidate answer, evaluation dimension, and scoring criteria.\n"
+    "\n"
+    "Follow these steps:\n"
+    "1. Assign one integer score from 0 to 5 according to the provided scoring criteria.\n"
+    "2. Provide a concise but concrete reason for the score. The reason should explain "
+    "the candidate answer's strengths, weaknesses, missing elements, unsupported claims, "
+    "or failures to satisfy the evaluation dimension. When identifying a specific "
+    "problem, explicitly mark it with the prefix \"error:\".\n"
+    "3. Based on the scoring reason, provide actionable revision suggestions explaining "
+    "how the candidate answer should be revised to better satisfy the score-5 criterion.\n"
+    "4. Rewrite the candidate answer into a stronger modified_answer for the same "
+    "question and the same evaluation dimension. The modified_answer should address the "
+    "identified errors, follow the revision suggestions, and avoid adding unsupported "
+    "facts.\n"
+    "5. Return strict JSON only with exactly this schema:\n"
+    "{\"score\": <int>, \"reason\": \"...\", \"revision_suggestions\": \"...\", "
+    "\"modified_answer\": \"...\"}"
 )
 
 USER_TEMPLATE = (
     "{instruction}\n\n"
     "Question:\n{question}\n\n"
-    "Answer:\n{answer}\n\n"
-    "Evaluation_dimension:\n{dimension_name}\n\n"
-    "Criteria:\n{dimension_criteria}"
+    "Candidate Answer:\n{answer}\n\n"
+    "Evaluation Dimension:\n{dimension_name}\n\n"
+    "Score Criteria (0-5):\n{score_criteria}"
 )
 
-ASSISTANT_TEMPLATE = (
-    "Score: {score}\n"
-    "Reason: {reason}\n"
-    "Modified Answer: {modified_answer}"
-)
+ASSISTANT_FORMAT = "json"
 
 # If True, put existing reason into user prompt as extra context.
 # Default False to avoid leaking label target into input.
@@ -82,9 +96,12 @@ USER_REASON_TEMPLATE = "\n\nReference Information (Optional):\n{input_reason}"
 
 # If True, skip samples with empty score/reason/modified_answer.
 REQUIRE_NON_EMPTY_LABELS = True
+REQUIRE_NON_EMPTY_REVISION_SUGGESTIONS = False
 
-# New: force criteria non-empty by default.
+# Force complete 0-5 score criteria by default. This matches the new SFT input
+# contract: {Q+A+D+Cs}.
 REQUIRE_NON_EMPTY_CRITERIA = True
+REQUIRE_COMPLETE_SCORE_CRITERIA = True
 # ==========================================================
 
 CANDIDATE_LIST_KEYS = ("items", "data", "samples", "records", "results")
@@ -101,22 +118,48 @@ CRITERIA_FIELD_CANDIDATES = (
     "description",
 )
 
+SCORE_CRITERIA_FIELD_CANDIDATES = (
+    "score_criteria",
+    "0-5_Criteria",
+    "criteria_by_score",
+    "criteria_map",
+    "rubric_by_score",
+    "scoring_rubric",
+)
+
 SCORE_FIELD_CANDIDATES = (
     "modified_score",
+    "predicted_score",
+    "Score",
     "score",
 )
 
 REASON_FIELD_CANDIDATES = (
+    "predicted_reason",
+    "Reason",
     "reason",
     "feedback",
     "rationale",
 )
 
+REVISION_SUGGESTIONS_FIELD_CANDIDATES = (
+    "revision_suggestions",
+    "edit_intent",
+    "edit_suggestion",
+    "modification_suggestion",
+    "modification_suggestions",
+    "rewrite_suggestions",
+)
+
 MODIFIED_ANSWER_FIELD_CANDIDATES = (
+    "predicted_modified_answer",
     "modified_answer",
+    "Modify_ans",
+    "modify_ans",
     "rewritten_answer",
     "rewrite",
     "revised_answer",
+    "better_answer",
 )
 
 SINGLE_TO_DIMENSIONS_SUFFIX_RULES = (
@@ -169,6 +212,7 @@ class FileStats:
     dims_skipped_missing_label: int = 0
     dims_skipped_missing_name: int = 0
     dims_skipped_missing_criteria: int = 0
+    dims_skipped_incomplete_score_criteria: int = 0
 
 
 @dataclass
@@ -396,11 +440,19 @@ def _build_dimension_meta_map(sample: dict[str, Any]) -> dict[str, dict[str, Any
                 if field in item and field not in meta and not _is_empty(item.get(field)):
                     meta[field] = item.get(field)
 
+            for field in SCORE_CRITERIA_FIELD_CANDIDATES:
+                if field in item and field not in meta and not _is_empty(item.get(field)):
+                    meta[field] = item.get(field)
+
             for field in SCORE_FIELD_CANDIDATES:
                 if field in item and field not in meta and not _is_empty(item.get(field)):
                     meta[field] = item.get(field)
 
             for field in REASON_FIELD_CANDIDATES:
+                if field in item and field not in meta and not _is_empty(item.get(field)):
+                    meta[field] = item.get(field)
+
+            for field in REVISION_SUGGESTIONS_FIELD_CANDIDATES:
                 if field in item and field not in meta and not _is_empty(item.get(field)):
                     meta[field] = item.get(field)
 
@@ -424,12 +476,138 @@ def _format_score(score: Any) -> str:
     return str(score)
 
 
+def _parse_score_criteria_text(text: str) -> dict[str, str]:
+    criteria: dict[str, str] = {}
+    current_score: str | None = None
+    for raw_line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(r"^(?:score\s*)?([0-5])\s*[:：]\s*(.+)$", line, flags=re.I)
+        if match:
+            current_score = match.group(1)
+            criteria[current_score] = match.group(2).strip()
+        elif current_score is not None:
+            criteria[current_score] = f"{criteria[current_score]} {line}".strip()
+    return criteria
+
+
+def _normalize_score_criteria_from_value(value: Any) -> dict[str, str]:
+    if isinstance(value, dict):
+        criteria: dict[str, str] = {}
+        for score in range(6):
+            score_key = str(score)
+            text = value.get(score_key)
+            if text is None:
+                text = value.get(score)
+            if not _is_empty(text):
+                criteria[score_key] = str(text).strip()
+        return criteria
+
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            return _normalize_score_criteria_from_value(parsed)
+        return _parse_score_criteria_text(value)
+
+    return {}
+
+
+def _normalize_score_criteria_from_source(
+    source: dict[str, Any],
+    *,
+    full_score_criteria: str = "",
+) -> dict[str, str]:
+    criteria: dict[str, str] = {}
+
+    for field in SCORE_CRITERIA_FIELD_CANDIDATES:
+        if field not in source or _is_empty(source.get(field)):
+            continue
+        criteria.update(_normalize_score_criteria_from_value(source.get(field)))
+
+    for score in range(6):
+        score_key = str(score)
+        value, _ = _first_non_empty_from_dict(
+            source,
+            (
+                f"criteria_{score}",
+                f"score_{score}",
+                f"score_{score}_criteria",
+                f"criterion_{score}",
+            ),
+        )
+        if not _is_empty(value):
+            criteria[score_key] = str(value).strip()
+
+    if not _is_empty(full_score_criteria) and _is_empty(criteria.get("5")):
+        criteria["5"] = str(full_score_criteria).strip()
+
+    return {str(score): criteria.get(str(score), "") for score in range(6)}
+
+
+def _has_complete_score_criteria(criteria: dict[str, str]) -> bool:
+    return all(not _is_empty(criteria.get(str(score))) for score in range(6))
+
+
+def _format_score_criteria(criteria: dict[str, str]) -> str:
+    return "\n".join(
+        f"Score {score}: {str(criteria.get(str(score), '')).strip()}"
+        for score in range(6)
+        if not _is_empty(criteria.get(str(score)))
+    )
+
+
+def _resolve_score_criteria(
+    dim: dict[str, Any],
+    meta: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    full_score_criteria: str,
+) -> tuple[dict[str, str], str]:
+    for source_name, source in (("dim", dim), ("meta", meta), ("row", row)):
+        criteria = _normalize_score_criteria_from_source(
+            source,
+            full_score_criteria=full_score_criteria if source_name == "row" else "",
+        )
+        if any(not _is_empty(v) for v in criteria.values()):
+            return criteria, source_name
+
+    if not _is_empty(full_score_criteria):
+        return _normalize_score_criteria_from_source(
+            {},
+            full_score_criteria=full_score_criteria,
+        ), "full_score_only"
+
+    return {}, "missing"
+
+
+def _build_revision_suggestions(
+    *,
+    explicit_value: Any,
+    reason: str,
+    dimension_name: str,
+    score_criteria_text: str,
+) -> str:
+    if not _is_empty(explicit_value):
+        return str(explicit_value).strip()
+    if _is_empty(reason):
+        return ""
+    return (
+        "Revise the answer to address the specific issue identified in the reason: "
+        f"{reason} Ensure the revision satisfies the score-5 requirement for "
+        f"'{dimension_name}' under the provided score criteria."
+    )
+
+
 def _build_user_content(
     *,
     question: str,
     answer: str,
     dimension_name: str,
-    dimension_criteria: str,
+    score_criteria_text: str,
     input_reason: str,
     include_reason_in_user: bool,
 ) -> str:
@@ -438,19 +616,36 @@ def _build_user_content(
         question=question,
         answer=answer,
         dimension_name=dimension_name,
-        dimension_criteria=dimension_criteria,
+        score_criteria=score_criteria_text,
     )
     if include_reason_in_user and not _is_empty(input_reason):
         user_text += USER_REASON_TEMPLATE.format(input_reason=input_reason)
     return user_text
 
 
-def _build_assistant_content(*, score: Any, reason: str, modified_answer: str) -> str:
-    return ASSISTANT_TEMPLATE.format(
-        score=_format_score(score),
-        reason=reason,
-        modified_answer=modified_answer,
+def _build_assistant_content(
+    *,
+    score: Any,
+    reason: str,
+    revision_suggestions: str,
+    modified_answer: str,
+) -> str:
+    payload = {
+        "score": int(score) if str(score).strip().isdigit() else _format_score(score),
+        "reason": reason,
+        "revision_suggestions": revision_suggestions,
+        "modified_answer": modified_answer,
+    }
+    if ASSISTANT_FORMAT == "json":
+        return json.dumps(payload, ensure_ascii=False)
+
+    return (
+        f"Score: {payload['score']}\n"
+        f"Reason: {reason}\n"
+        f"Revision Suggestions: {revision_suggestions}\n"
+        f"Modified Answer: {modified_answer}"
     )
+
 
 
 def _resolve_dimension_criteria(
@@ -500,7 +695,9 @@ def _convert_one_file(
     dataset_name: str,
     include_reason_in_user: bool,
     require_non_empty_labels: bool,
+    require_non_empty_revision_suggestions: bool,
     require_non_empty_criteria: bool,
+    require_complete_score_criteria: bool,
     missing_criteria_sources: Counter[str],
     missing_criteria_examples: dict[str, list[str]],
     found_criteria_sources: Counter[str],
@@ -518,8 +715,11 @@ def _convert_one_file(
         answer = str(row.get("answer") or "").strip()
         per_dim = row.get("per_dimension_results")
         if not isinstance(per_dim, list) or not per_dim:
-            stats.rows_skipped_no_per_dim += 1
-            continue
+            if first_non_empty := str(row.get("dimension_name") or row.get("evaluation_dimension") or "").strip():
+                per_dim = [{**row, "dimension_name": first_non_empty}]
+            else:
+                stats.rows_skipped_no_per_dim += 1
+                continue
 
         dim_meta_map = _build_dimension_meta_map(row)
 
@@ -545,6 +745,16 @@ def _convert_one_file(
                     answer=answer,
                     dimension_name=dim_name,
                 )
+            score_criteria, score_criteria_source = _resolve_score_criteria(
+                dim,
+                meta,
+                row,
+                full_score_criteria=dim_criteria,
+            )
+            if _is_empty(dim_criteria) and not _is_empty(score_criteria.get("5")):
+                dim_criteria = score_criteria["5"]
+                criteria_source = f"score_criteria_5:{score_criteria_source}"
+
             if _is_empty(dim_criteria):
                 missing_criteria_sources[criteria_source] += 1
                 if len(missing_criteria_examples[path.name]) < 10:
@@ -552,18 +762,38 @@ def _convert_one_file(
             else:
                 found_criteria_sources[criteria_source] += 1
 
+            score_criteria_text = _format_score_criteria(score_criteria)
+
             score, _ = _first_non_empty_from_dict(dim, SCORE_FIELD_CANDIDATES)
             if _is_empty(score):
                 score, _ = _first_non_empty_from_dict(meta, SCORE_FIELD_CANDIDATES)
+            if _is_empty(score):
+                score, _ = _first_non_empty_from_dict(row, SCORE_FIELD_CANDIDATES)
 
             reason, _ = _first_non_empty_from_dict(dim, REASON_FIELD_CANDIDATES)
             if _is_empty(reason):
                 reason, _ = _first_non_empty_from_dict(meta, REASON_FIELD_CANDIDATES)
+            if _is_empty(reason):
+                reason, _ = _first_non_empty_from_dict(row, REASON_FIELD_CANDIDATES)
             reason = str(reason or "").strip()
+
+            revision_suggestions, _ = _first_non_empty_from_dict(dim, REVISION_SUGGESTIONS_FIELD_CANDIDATES)
+            if _is_empty(revision_suggestions):
+                revision_suggestions, _ = _first_non_empty_from_dict(meta, REVISION_SUGGESTIONS_FIELD_CANDIDATES)
+            if _is_empty(revision_suggestions):
+                revision_suggestions, _ = _first_non_empty_from_dict(row, REVISION_SUGGESTIONS_FIELD_CANDIDATES)
+            revision_suggestions = _build_revision_suggestions(
+                explicit_value=revision_suggestions,
+                reason=reason,
+                dimension_name=dim_name,
+                score_criteria_text=score_criteria_text,
+            )
 
             modified_answer, _ = _first_non_empty_from_dict(dim, MODIFIED_ANSWER_FIELD_CANDIDATES)
             if _is_empty(modified_answer):
                 modified_answer, _ = _first_non_empty_from_dict(meta, MODIFIED_ANSWER_FIELD_CANDIDATES)
+            if _is_empty(modified_answer):
+                modified_answer, _ = _first_non_empty_from_dict(row, MODIFIED_ANSWER_FIELD_CANDIDATES)
             if _is_empty(modified_answer):
                 modified_answer = row.get("modified_answer")
             if _is_empty(modified_answer):
@@ -576,21 +806,31 @@ def _convert_one_file(
                 stats.dims_skipped_missing_label += 1
                 continue
 
-            if require_non_empty_criteria and _is_empty(dim_criteria):
+            if require_non_empty_revision_suggestions and _is_empty(revision_suggestions):
+                stats.dims_skipped_missing_label += 1
+                continue
+
+            if require_non_empty_criteria and _is_empty(score_criteria_text):
                 stats.dims_skipped_missing_criteria += 1
+                continue
+
+            if require_complete_score_criteria and not _has_complete_score_criteria(score_criteria):
+                stats.dims_skipped_incomplete_score_criteria += 1
+                missing_criteria_sources[f"incomplete_score_criteria:{score_criteria_source}"] += 1
                 continue
 
             user_content = _build_user_content(
                 question=question,
                 answer=answer,
                 dimension_name=dim_name,
-                dimension_criteria=dim_criteria,
+                score_criteria_text=score_criteria_text,
                 input_reason=reason,
                 include_reason_in_user=include_reason_in_user,
             )
             assistant_content = _build_assistant_content(
                 score=score,
                 reason=reason,
+                revision_suggestions=revision_suggestions,
                 modified_answer=modified_answer,
             )
 
@@ -703,9 +943,20 @@ def main() -> None:
         help="Do not skip rows with empty score/reason/modified_answer.",
     )
     parser.add_argument(
+        "--require-revision-suggestions",
+        action="store_true",
+        default=REQUIRE_NON_EMPTY_REVISION_SUGGESTIONS,
+        help="Skip rows that do not have explicit revision_suggestions/edit_intent.",
+    )
+    parser.add_argument(
         "--allow-empty-criteria",
         action="store_true",
         help="Do not skip rows with empty criteria.",
+    )
+    parser.add_argument(
+        "--allow-incomplete-score-criteria",
+        action="store_true",
+        help="Allow samples without a complete 0-5 score criteria map.",
     )
     parser.add_argument(
         "--max-files",
@@ -722,6 +973,7 @@ def main() -> None:
     test_output_path = Path(args.test_output)
     require_non_empty_labels = not args.allow_empty_labels
     require_non_empty_criteria = not args.allow_empty_criteria
+    require_complete_score_criteria = not args.allow_incomplete_score_criteria
 
     if not input_root.is_dir():
         raise FileNotFoundError(f"Input root not found: {input_root}")
@@ -758,7 +1010,9 @@ def main() -> None:
                 dataset_name=dataset_name,
                 include_reason_in_user=args.include_reason_in_user,
                 require_non_empty_labels=require_non_empty_labels,
+                require_non_empty_revision_suggestions=args.require_revision_suggestions,
                 require_non_empty_criteria=require_non_empty_criteria,
+                require_complete_score_criteria=require_complete_score_criteria,
                 missing_criteria_sources=missing_criteria_sources,
                 missing_criteria_examples=missing_criteria_examples,
                 found_criteria_sources=found_criteria_sources,
@@ -769,12 +1023,13 @@ def main() -> None:
             print(
                 f"[OK] {fp.name} | rows={stats.rows_total}, dims={stats.dims_total}, "
                 f"emitted={stats.dims_emitted}, missing_label={stats.dims_skipped_missing_label}, "
-                f"missing_criteria={stats.dims_skipped_missing_criteria}"
+                f"missing_criteria={stats.dims_skipped_missing_criteria}, "
+                f"incomplete_score_criteria={stats.dims_skipped_incomplete_score_criteria}"
             )
         except Exception as exc:
             print(f"[SKIP] {fp} | {exc}")
 
-    # _write_jsonl(all_records, output_path)
+    _write_jsonl(all_records, output_path)
     train_records, test_records = _split_train_test(
         all_records,
         test_ratio=args.test_ratio,
@@ -791,6 +1046,7 @@ def main() -> None:
     total_missing_label = sum(s.dims_skipped_missing_label for s in all_stats)
     total_missing_name = sum(s.dims_skipped_missing_name for s in all_stats)
     total_missing_criteria = sum(s.dims_skipped_missing_criteria for s in all_stats)
+    total_incomplete_score_criteria = sum(s.dims_skipped_incomplete_score_criteria for s in all_stats)
 
     print("\n===== Summary =====")
     print(f"files={len(all_stats)}")
@@ -801,6 +1057,7 @@ def main() -> None:
     print(f"dims_missing_label={total_missing_label}")
     print(f"dims_missing_name={total_missing_name}")
     print(f"dims_missing_criteria={total_missing_criteria}")
+    print(f"dims_incomplete_score_criteria={total_incomplete_score_criteria}")
     print(f"merged_output={output_path}")
     print(f"train_output={train_output_path} | train_count={len(train_records)}")
     print(f"test_output={test_output_path} | test_count={len(test_records)}")

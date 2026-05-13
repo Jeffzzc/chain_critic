@@ -76,7 +76,8 @@ LOW_SCORE_SYSTEM_PROMPT = (
     "- and a target score from 0 to 4.\n\n"
     "Your task:\n"
     "1. Generate one plausible student answer that should receive exactly the target score on the specified dimension.\n"
-    "2. Generate one strict, rubric-grounded Reason explaining why the generated answer matches the target score.\n\n"
+    "2. Generate one strict, rubric-grounded Reason explaining why the generated answer matches the target score.\n"
+    "3. Generate executable revision_suggestions for improving the generated answer to score 5.\n\n"
     "Hard constraints:\n"
     "- Return strict JSON only.\n"
     "- The returned Score must be exactly equal to the Target Score.\n"
@@ -88,6 +89,7 @@ LOW_SCORE_SYSTEM_PROMPT = (
     "- Do not assume or copy any unseen perfect answer.\n"
     "- The Reason must be specific and strict: explicitly identify the flaw, missing element, inconsistency, or weakness "
     "that places the generated_answer at the target score, and briefly indicate why it does not fit the nearest adjacent score(s).\n"
+    "- The revision_suggestions must be concrete edit instructions that would fix the identified flaw and move the answer to score 5.\n"
     "- Do not use vague comments such as 'could be improved', 'somewhat unclear', or 'a little weak'.\n"
     "- Do not include dirty formatting inside any field: no markdown headings, no bullet lists, no numbered lists, "
     "no code fences, no bold markers, no '####', and no field labels such as 'Score:' or 'Reason:' inside text fields.\n"
@@ -96,7 +98,8 @@ LOW_SCORE_SYSTEM_PROMPT = (
     "1. Score is exactly the Target Score.\n"
     "2. generated_answer matches the target criterion better than the adjacent criteria.\n"
     "3. Reason explicitly justifies the target score using the rubric language and the actual flaw in the generated_answer.\n"
-    "4. All text fields are plain text with no dirty formatting.\n"
+    "4. revision_suggestions states executable edits, not generic encouragement.\n"
+    "5. All text fields are plain text with no dirty formatting.\n"
 )
 
 REWRITE_SYSTEM_PROMPT = (
@@ -137,6 +140,7 @@ GEN_REPAIR_SYSTEM_PROMPT = (
     "Required keys:\n"
     "- Score\n"
     "- Reason\n"
+    "- revision_suggestions\n"
     "- generated_answer\n"
 )
 
@@ -159,7 +163,7 @@ LOW_SCORE_USER_TEMPLATE = (
     "Rubric focus for exact score control:\n{score_band_guidance}\n\n"
     "Dimension-specific guidance:\n{dimension_guidance}\n\n"
     "Return JSON only with keys:\n"
-    "{{\"Score\": <int>, \"Reason\": \"...\", \"generated_answer\": \"...\"}}"
+    "{{\"Score\": <int>, \"Reason\": \"...\", \"revision_suggestions\": \"...\", \"generated_answer\": \"...\"}}"
 )
 
 REWRITE_USER_TEMPLATE = (
@@ -227,7 +231,7 @@ DIRTY_TEXT_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"(?m)^\s*\d+[.)]\s+"), "contains numbered list"),
     (re.compile(r"\*\*|__"), "contains bold marker"),
     (re.compile(r"####"), "contains #### marker"),
-    (re.compile(r"(?im)(^|\n)\s*(score|reason|modified answer|generated_answer|modified_answer)\s*:"), "contains field label"),
+    (re.compile(r"(?im)(^|\n)\s*(score|reason|revision suggestions|edit intent|modified answer|generated_answer|modified_answer)\s*:"), "contains field label"),
 ]
 
 # Common English words for gibberish detection
@@ -473,7 +477,7 @@ def build_generation_repair_messages(
         "Previous invalid/incomplete JSON:\n"
         f"{json.dumps(bad_payload or {}, ensure_ascii=False, indent=2)}\n\n"
         "Rewrite into strict JSON only with keys:\n"
-        '{"Score": <int>, "Reason": "...", "generated_answer": "..."}'
+        '{"Score": <int>, "Reason": "...", "revision_suggestions": "...", "generated_answer": "..."}'
     )
     return [
         {"role": "system", "content": GEN_REPAIR_SYSTEM_PROMPT},
@@ -816,6 +820,13 @@ def normalize_generation_payload(
     return {
         "Score": score,
         "Reason": str(parsed.get("Reason", "")).strip(),
+        "revision_suggestions": str(
+            parsed.get("revision_suggestions")
+            or parsed.get("edit_intent")
+            or parsed.get("Revision Suggestions")
+            or parsed.get("Edit Intent")
+            or ""
+        ).strip(),
         "generated_answer": str(parsed.get("generated_answer", "")).strip(),
     }
 
@@ -828,7 +839,7 @@ def validate_generation_payload(
     issues: List[str] = []
     if normalized is None:
         return False, ["normalized generation payload is None"]
-    for key in ["Score", "Reason", "generated_answer"]:
+    for key in ["Score", "Reason", "revision_suggestions", "generated_answer"]:
         if key not in normalized:
             issues.append(f"missing key: {key}")
     score = normalized.get("Score")
@@ -838,6 +849,8 @@ def validate_generation_payload(
         issues.append(f"Score {score} does not match target_score {target_score}")
     if not str(normalized.get("Reason", "")).strip():
         issues.append("Reason is empty")
+    if not str(normalized.get("revision_suggestions", "")).strip():
+        issues.append("revision_suggestions is empty")
     if not str(normalized.get("generated_answer", "")).strip():
         issues.append("generated_answer is empty")
     return len(issues) == 0, issues
@@ -1188,6 +1201,8 @@ async def worker(
                 "0-5_Criteria": normalize_score_criteria(record),
                 "Score": normalized_generation["Score"],
                 "Reason": normalized_generation["Reason"],
+                "revision_suggestions": normalized_generation["revision_suggestions"],
+                "edit_intent": normalized_generation["revision_suggestions"],
                 "answer": normalized_generation["generated_answer"],
                 "generated_answer": normalized_generation["generated_answer"],
                 "modified_answer": normalized_rewrite["modified_answer"],

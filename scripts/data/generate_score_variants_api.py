@@ -72,10 +72,11 @@ SYSTEM_PROMPT = (
     "8. If the target score is high (4), the generated answer should satisfy the full-score criteria well.\n"
     "9. The reason must explicitly point to concrete problems or strengths in the generated answer, "
     "rather than giving vague generic comments.\n"
-    "10. Also generate a modified answer that genuinely fixes the problems and satisfies the "
+    "10. Generate revision_suggestions with executable edits that would fix the generated answer.\n"
+    "11. Also generate a modified answer that genuinely fixes the problems and satisfies the "
     "full-score criteria.\n"
-    "11. The modified answer must not be a superficial rephrasing; it should correct the actual defects.\n"
-    "12. Return strict JSON only."
+    "12. The modified answer must not be a superficial rephrasing; it should correct the actual defects.\n"
+    "13. Return strict JSON only."
 )
 
 
@@ -92,9 +93,10 @@ USER_TEMPLATE = (
     "3. Keep the answer relevant to the question.\n"
     "4. Make the score difference come primarily from the specified dimension.\n"
     "5. Also generate a modified answer that is revised to satisfy the given full-score criteria.\n"
-    "6. Do not mention the rubric or target score inside the answers.\n"
-    "7. Return JSON only with this schema:\n"
-    "{{\"Score\": {target_score},\"Reason\": \"...\", \"generated_answer\": \"...\", \"modified_answer\": \"...\"}}"
+    "6. Generate revision_suggestions as concrete edit instructions for moving the generated answer to score 5.\n"
+    "7. Do not mention the rubric or target score inside the answers.\n"
+    "8. Return JSON only with this schema:\n"
+    "{{\"Score\": {target_score},\"Reason\": \"...\", \"revision_suggestions\": \"...\", \"generated_answer\": \"...\", \"modified_answer\": \"...\"}}"
 )
 
 
@@ -528,6 +530,20 @@ async def worker(
                 "full_score_criteria": record.get("full_score_criteria"),
                 "Score": parsed_score,
                 "Reason": get_payload_value(parsed, "Reason", "reason"),
+                "revision_suggestions": get_payload_value(
+                    parsed,
+                    "revision_suggestions",
+                    "edit_intent",
+                    "Revision Suggestions",
+                    "Edit Intent",
+                ),
+                "edit_intent": get_payload_value(
+                    parsed,
+                    "revision_suggestions",
+                    "edit_intent",
+                    "Revision Suggestions",
+                    "Edit Intent",
+                ),
                 "modified_answer": get_payload_value(parsed, "modified_answer"),
                 # "raw_response": raw_text,
             }

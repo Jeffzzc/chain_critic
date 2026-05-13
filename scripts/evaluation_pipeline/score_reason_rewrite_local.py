@@ -52,13 +52,21 @@ if load_dotenv is not None:
 
 SCORE_LINE_RE = re.compile(rf"(?im)^\s*score\s*{COLON_CLASS}\s*([0-5])\s*$")
 REASON_RE = re.compile(
-    rf"(?is)reason\s*{COLON_CLASS}\s*(.*?)\s*(?:(?:\n\s*)?(?:modified answer|revised answer)\s*{COLON_CLASS}|$)"
+    rf"(?is)reason\s*{COLON_CLASS}\s*(.*?)\s*(?:(?:\n\s*)?(?:revision suggestions|edit intent|modified answer|revised answer)\s*{COLON_CLASS}|$)"
+)
+REVISION_RE = re.compile(
+    rf"(?is)(?:revision suggestions|edit intent)\s*{COLON_CLASS}\s*(.*?)\s*(?:(?:\n\s*)?(?:modified answer|revised answer)\s*{COLON_CLASS}|$)"
 )
 MODIFIED_RE = re.compile(rf"(?is)(?:modified answer|revised answer)\s*{COLON_CLASS}\s*(.*)$")
 
 JSON_CODE_BLOCK_RE = re.compile(r"(?is)^\s*```(?:json)?\s*(.*?)\s*```\s*$")
 JSON_SCORE_RE = re.compile(r'(?is)["\']?score["\']?\s*:\s*([0-5])')
 JSON_REASON_RE = re.compile(r'(?is)["\']?reason["\']?\s*:\s*"((?:\\.|[^"\\])*)"')
+JSON_REVISION_RES = [
+    re.compile(r'(?is)["\']?revision_suggestions["\']?\s*:\s*"((?:\\.|[^"\\])*)"'),
+    re.compile(r'(?is)["\']?edit_intent["\']?\s*:\s*"((?:\\.|[^"\\])*)"'),
+    re.compile(r'(?is)["\']?revision suggestions["\']?\s*:\s*"((?:\\.|[^"\\])*)"'),
+]
 JSON_MODIFIED_RES = [
     re.compile(r'(?is)["\']?modified_answer["\']?\s*:\s*"((?:\\.|[^"\\])*)"'),
     re.compile(r'(?is)["\']?revised_answer["\']?\s*:\s*"((?:\\.|[^"\\])*)"'),
@@ -68,17 +76,31 @@ JSON_MODIFIED_RES = [
 
 
 SYSTEM_PROMPT = (
-    "You are a strict answer evaluation and revision model.\n"
-    "Evaluate the candidate answer using ONLY the provided question, evaluation dimension, "
-    "and complete score criteria. Then rewrite the candidate answer into a better "
-    "answer for the original question, optimized for the same evaluation dimension.\n"
-    "Do not introduce unsupported facts. If the question is underspecified, make the "
-    "minimum necessary assumption explicit.\n"
-    "Return strict JSON only, with this exact schema:\n"
-    '{"score": 1, "reason": "...", "modified_answer": "..."}\n'
-    "The score must be an integer within the provided score range. The reason must be concise and based on the rubric. "
-    "The modified_answer must be a complete improved answer to the question."
+    "You are an expert answer evaluator and rewriter.\n"
+    "Your task is to evaluate a candidate answer to a given question under the provided "
+    "evaluation dimension and complete 0-5 scoring criteria, then rewrite the candidate answer "
+    "into a stronger answer optimized for the same evaluation dimension.\n\n"
+
+    "Use ONLY the provided question, candidate answer, evaluation dimension, and scoring criteria. "
+    "Do not introduce unsupported facts, external knowledge, or assumptions beyond the given context. "
+    "If the question is underspecified, make only the minimum necessary assumption explicit in the rewritten answer.\n\n"
+
+    "Evaluation requirements:\n"
+    "1. Assign one integer score from 0 to 5 according to the provided scoring criteria.\n"
+    "2. The reason must be concise, concrete, and based directly on the rubric. "
+    "It should identify the candidate answer's strengths, weaknesses, missing elements, "
+    "unsupported claims, or failures to satisfy the evaluation dimension. "
+    "When pointing out a concrete problem, mark it with the prefix \"error:\".\n"
+    "3. The revision_suggestions field must give actionable edits that directly address "
+    "the problems identified in the reason and explain how to better satisfy the score-5 criterion.\n"
+    "4. The modified_answer must be a complete improved answer to the original question, "
+    "optimized for the same evaluation dimension, and must address the identified errors without adding unsupported facts.\n\n"
+
+    "Return strict JSON only. Do not include markdown, explanations, comments, or extra text. "
+    "Use exactly this schema:\n"
+    "{\"score\": 1, \"reason\": \"...\", \"revision_suggestions\": \"...\", \"modified_answer\": \"...\"}"
 )
+
 
 def strip_code_fence(text: str) -> str:
     match = JSON_CODE_BLOCK_RE.match(text.strip())
@@ -143,6 +165,7 @@ def decode_json_string_fragment(fragment: str) -> str:
 def extract_json_like_fields(text: str) -> dict[str, Any]:
     score: Optional[int] = None
     reason = ""
+    revision_suggestions = ""
     modified_answer = ""
 
     score_match = JSON_SCORE_RE.search(text)
@@ -153,6 +176,12 @@ def extract_json_like_fields(text: str) -> dict[str, Any]:
     if reason_match:
         reason = decode_json_string_fragment(reason_match.group(1))
 
+    for pattern in JSON_REVISION_RES:
+        revision_match = pattern.search(text)
+        if revision_match:
+            revision_suggestions = decode_json_string_fragment(revision_match.group(1))
+            break
+
     for pattern in JSON_MODIFIED_RES:
         modified_match = pattern.search(text)
         if modified_match:
@@ -162,6 +191,7 @@ def extract_json_like_fields(text: str) -> dict[str, Any]:
     return {
         "score": score,
         "reason": reason,
+        "revision_suggestions": revision_suggestions,
         "modified_answer": modified_answer,
     }
 
@@ -188,6 +218,12 @@ def parse_model_output(text: str) -> dict[str, Any]:
             parsed.get("reason")
             or parsed.get("Reason")
         )
+        revision_suggestions = normalize_text(
+            parsed.get("revision_suggestions")
+            or parsed.get("edit_intent")
+            or parsed.get("Revision Suggestions")
+            or parsed.get("Edit Intent")
+        )
         modified_answer = normalize_text(
             parsed.get("modified_answer")
             or parsed.get("revised_answer")
@@ -196,10 +232,11 @@ def parse_model_output(text: str) -> dict[str, Any]:
             or parsed.get("Revised Answer")
             or parsed.get("Better Answer")
         )
-        ok = score is not None and bool(reason) and bool(modified_answer)
+        ok = score is not None and bool(reason) and bool(revision_suggestions) and bool(modified_answer)
         return {
             "score": score,
             "reason": reason,
+            "revision_suggestions": revision_suggestions,
             "modified_answer": modified_answer,
             "raw_output": raw_text,
             "parse_error": None if ok else "Parsed JSON but some required fields are missing.",
@@ -211,11 +248,13 @@ def parse_model_output(text: str) -> dict[str, Any]:
         ok = (
             json_like["score"] is not None
             and bool(json_like["reason"])
+            and bool(json_like["revision_suggestions"])
             and bool(json_like["modified_answer"])
         )
         return {
             "score": json_like["score"],
             "reason": json_like["reason"],
+            "revision_suggestions": json_like["revision_suggestions"],
             "modified_answer": json_like["modified_answer"],
             "raw_output": raw_text,
             "parse_error": None if ok else "Recovered partial fields from malformed JSON-like output.",
@@ -224,6 +263,7 @@ def parse_model_output(text: str) -> dict[str, Any]:
 
     score: int | None = None
     reason = ""
+    revision_suggestions = ""
     modified_answer = ""
     parse_error: str | None = None
 
@@ -238,15 +278,19 @@ def parse_model_output(text: str) -> dict[str, Any]:
             parse_error = "Failed to parse score."
 
     reason_match = REASON_RE.search(cleaned_text)
+    revision_match = REVISION_RE.search(cleaned_text)
     modified_match = MODIFIED_RE.search(cleaned_text)
     if reason_match:
         reason = normalize_text(reason_match.group(1))
+    if revision_match:
+        revision_suggestions = normalize_text(revision_match.group(1))
     if modified_match:
         modified_answer = normalize_text(modified_match.group(1))
 
     return {
         "score": score,
         "reason": reason,
+        "revision_suggestions": revision_suggestions,
         "modified_answer": modified_answer,
         "raw_output": raw_text,
         "parse_error": parse_error,
@@ -417,7 +461,8 @@ def build_user_prompt_with_range(
         "Tasks:\n"
         f"1. Assign one integer score from {score_range_label} to the candidate answer based on the given evaluation dimension and the provided rubric.\n"
         "2. Give a concise reason grounded in the score criteria.\n"
-        "3. Rewrite a better answer to the original question that would satisfy the dimension better.\n\n"
+        "3. Give executable revision suggestions that directly state how to fix the answer.\n"
+        "4. Rewrite a better answer to the original question that would satisfy the dimension better.\n\n"
         "Return strict JSON only."
     )
 
@@ -435,7 +480,8 @@ def build_user_prompt(question: str, answer: str, dimension_name: str, criteria_
         "Tasks:\n"
         "1. Assign one integer score from 0 to 5 to the candidate answer based on the given evaluation dimension and the provided 0–5 scoring rubric.\n"
         "2. Give a concise reason grounded in the score criteria.\n"
-        "3. Rewrite a better answer to the original question that would satisfy the dimension better.\n\n"
+        "3. Give executable revision suggestions that directly state how to fix the answer.\n"
+        "4. Rewrite a better answer to the original question that would satisfy the dimension better.\n\n"
         "Return strict JSON only."
     )
 
@@ -469,6 +515,8 @@ def run_one(
         "criteria_text": sample["criteria_text"],
         "predicted_score": None,
         "predicted_reason": "",
+        "revision_suggestions": "",
+        "edit_intent": "",
         "predicted_modified_answer": "",
         "raw_output": "",
         "ok": False,
@@ -498,11 +546,18 @@ def run_one(
         parse_error = parsed["parse_error"]
         if parsed["score"] is not None and not score_in_range:
             parse_error = f"Score {parsed['score']} is outside allowed range {sorted(allowed_scores)}."
-        ok = score_in_range and bool(parsed["reason"]) and bool(parsed["modified_answer"])
+        ok = (
+            score_in_range
+            and bool(parsed["reason"])
+            and bool(parsed["revision_suggestions"])
+            and bool(parsed["modified_answer"])
+        )
         row.update(
             {
                 "predicted_score": parsed["score"],
                 "predicted_reason": parsed["reason"],
+                "revision_suggestions": parsed["revision_suggestions"],
+                "edit_intent": parsed["revision_suggestions"],
                 "predicted_modified_answer": parsed["modified_answer"],
                 "raw_output": parsed["raw_output"],
                 "ok": ok,
@@ -704,10 +759,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=Path,
-        default="datasets/MATH500/0-5_rubric.jsonl",
+        default="datasets/0-5/score_criteria_0_5.jsonl",
         help="Flat rubric JSONL (supports complete 0-5 or 1-5 criteria).",
     )
-    parser.add_argument("--output", type=Path, default="datasets/MATH500/final/Ministral-3-14B-Instruct-2512.jsonl", help="Prediction output JSONL.")
+    parser.add_argument("--output", type=Path, default="datasets/0-5/score_reason_rewrite_original.jsonl", help="Prediction output JSONL.")
     parser.add_argument(
         "--answers",
         type=Path,
@@ -750,7 +805,7 @@ def parse_args() -> argparse.Namespace:
         help="One or more OpenAI-compatible base URLs. Comma-separated values are also accepted.",
     )
     parser.add_argument("--base-url-template", type=str, default=DEFAULT_BASE_URL_TEMPLATE)
-    parser.add_argument("--ports", nargs="*", default=["8001-8004"], help="Ports like: 8000 8001 or 8000-8003.")
+    parser.add_argument("--ports", nargs="*", default=["8001-8007"], help="Ports like: 8000 8001 or 8000-8003.")
     parser.add_argument("--model", type=str, default="", help="Model id. If empty, fetch from /models.")
     parser.add_argument("--api-key", type=str, default=DEFAULT_API_KEY)
     parser.add_argument(
@@ -759,7 +814,7 @@ def parse_args() -> argparse.Namespace:
         default="OPENAI_API_KEY",
         help="Environment variable used for external API key when --api-key is not provided.",
     )
-    parser.add_argument("--workers", type=int, default=64)
+    parser.add_argument("--workers", type=int, default=96)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--request-timeout", type=int, default=120)
