@@ -3,21 +3,19 @@
 Use with:
 
   swift rlhf --rlhf_type grpo \
-    --external_plugins scripts/train/grpo_reward_plugin.py \
+    --external_plugins scripts/train_grpo/grpo_reward_plugin.py \
     --reward_funcs chaincritic_weighted
 
-Reward inputs are expected to come from scripts/train/prepare_grpo_dataset.py.
-The implementation keeps all hyperparameters in environment variables so the
-shell training script can tune weights without editing Python.
-
-Reward components:
-- score_reward: generated Score vs target_score.
-- reason_reward: generated Reason vs the rubric item for the generated Score.
-- rewrite_reward: generated Modified Answer vs gt_answer embedding similarity.
+The reward intentionally uses only two components:
+1. revision_suggestions vs ground-truth revision_suggestions embedding
+   similarity. Reward is 1 when cosine similarity >= threshold, else 0.
+2. A verifier LLM judges whether the generated modified_answer is worse than
+   the original answer on the given dimension/rubric. WORSE -> 0, BETTER/SAME -> 1.
 """
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import os
@@ -27,18 +25,42 @@ from typing import Any, Optional
 from urllib import request as urllib_request
 
 try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None  # type: ignore[assignment]
+
+try:
     from swift.rewards import ORM, orms
 except Exception as exc:  # pragma: no cover
     raise RuntimeError(f"Failed to import ms-swift reward API: {exc}") from exc
 
-SCORE_LINE_RE = re.compile(r"(?im)^\s*score\s*[:\uFF1A]\s*([0-5])\s*$")
-REASON_RE = re.compile(
-    r"(?is)reason\s*[:\uFF1A]\s*(.*?)\s*(?:(?:\n\s*)?(?:modified answer|revised answer)\s*[:\uFF1A]|$)"
+
+REVISION_RE = re.compile(
+    r"(?is)(?:^|\n)\s*(?:revision[_ ]suggestions?|suggestions?)\s*[:\uFF1A]\s*"
+    r"(.*?)\s*(?=(?:\n\s*)?(?:modified[_ ]answer|revised[_ ]answer)\s*[:\uFF1A]|\Z)"
 )
-MODIFIED_RE = re.compile(r"(?is)(?:modified answer|revised answer)\s*[:\uFF1A]\s*(.*)$")
-CRITERION_RE = re.compile(
-    r"(?ms)(?:^|\n|\s)(?:Score\s*)?([0-5])\s*[:\uFF1A]\s*(.*?)(?=(?:^|\n|\s)(?:Score\s*)?[0-5]\s*[:\uFF1A]|\Z)"
-)
+MODIFIED_RE = re.compile(r"(?is)(?:^|\n)\s*(?:modified[_ ]answer|revised[_ ]answer)\s*[:\uFF1A]\s*(.*)$")
+SECTION_PATTERNS = {
+    "question": re.compile(r"(?im)^\s*Question\s*:\s*"),
+    "answer": re.compile(r"(?im)^\s*(?:Candidate\s+Answer|Original\s+Answer|Answer)\s*:\s*"),
+    "evaluation_dimension": re.compile(r"(?im)^\s*Evaluation(?:[_ ]+Dimension)?\s*:\s*"),
+    "criteria": re.compile(r"(?im)^\s*(?:Score\s+Criteria|Criteria)\s*(?:\(\s*0\s*-\s*5\s*\))?\s*:\s*"),
+}
+
+VERIFIER_SYSTEM_PROMPT = """You are a strict evaluator.
+Compare the revised answer against the original answer only on the given evaluation dimension and rubric.
+Judge whether the revised answer is better, the same, or worse than the original answer.
+
+Important rules:
+1. Evaluate only with respect to the provided evaluation dimension and score criteria.
+2. Do not reward verbosity unless it improves performance on the rubric.
+3. Penalize unsupported claims, incorrect reasoning, or rewrites that drift away from the question.
+4. If the revised answer does not clearly improve the original answer on this dimension, return SAME or WORSE.
+5. Output exactly one label and nothing else:
+BETTER
+SAME
+
+WORSE"""
 
 
 def env_float(name: str, default: float) -> float:
@@ -59,46 +81,15 @@ def normalize_text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
 
 
-def parse_int_score(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-        if math.isfinite(number):
-            rounded = round(number)
-            if abs(number - rounded) < 1e-6 and 0 <= rounded <= 5:
-                return int(rounded)
-        return None
-    match = re.search(r"\b([0-5])\b", str(value))
-    return int(match.group(1)) if match else None
-
-
 def clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
-
-
-def parse_completion(text: Any) -> dict[str, Any]:
-    raw = completion_to_text(text).strip().replace("\r\n", "\n")
-    score_match = SCORE_LINE_RE.search(raw)
-    reason_match = REASON_RE.search(raw)
-    modified_match = MODIFIED_RE.search(raw)
-    score = int(score_match.group(1)) if score_match else None
-    reason = normalize_text(reason_match.group(1)) if reason_match else ""
-    modified_answer = normalize_text(modified_match.group(1)) if modified_match else ""
-    return {
-        "score": score,
-        "reason": reason,
-        "modified_answer": modified_answer,
-        "raw_text": raw,
-        "is_valid": score is not None and bool(reason) and bool(modified_answer),
-    }
 
 
 def completion_to_text(completion: Any) -> str:
     if isinstance(completion, str):
         return completion
     if isinstance(completion, dict):
-        return normalize_text(completion.get("content"))
+        return str(completion.get("content") or "")
     if isinstance(completion, list):
         pieces = []
         for item in completion:
@@ -110,11 +101,128 @@ def completion_to_text(completion: Any) -> str:
     return str(completion or "")
 
 
-def parse_criteria(criteria_text: Any) -> dict[str, str]:
-    criteria: dict[str, str] = {}
-    for match in CRITERION_RE.finditer(str(criteria_text or "")):
-        criteria[match.group(1)] = normalize_text(match.group(2))
-    return criteria
+def parse_json_object(raw: str) -> Optional[dict[str, Any]]:
+    text = raw.strip()
+    candidates = [text]
+    fenced = re.search(r"(?is)```(?:json)?\s*(\{.*?\})\s*```", text)
+    if fenced:
+        candidates.append(fenced.group(1))
+    object_match = re.search(r"(?is)\{.*\}", text)
+    if object_match:
+        candidates.append(object_match.group(0))
+
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def first_non_empty(*values: Any) -> str:
+    for value in values:
+        text = normalize_text(value)
+        if text:
+            return text
+    return ""
+
+
+def parse_completion(text: Any) -> dict[str, Any]:
+    raw = completion_to_text(text).strip().replace("\r\n", "\n")
+    payload = parse_json_object(raw)
+    if payload is not None:
+        revision_suggestions = first_non_empty(
+            payload.get("revision_suggestions"),
+            payload.get("revision suggestion"),
+            payload.get("revision"),
+            payload.get("suggestions"),
+            payload.get("edit_intent"),
+        )
+        modified_answer = first_non_empty(
+            payload.get("modified_answer"),
+            payload.get("modified answer"),
+            payload.get("revised_answer"),
+            payload.get("revised answer"),
+        )
+    else:
+        revision_match = REVISION_RE.search(raw)
+        modified_match = MODIFIED_RE.search(raw)
+        revision_suggestions = normalize_text(revision_match.group(1)) if revision_match else ""
+        modified_answer = normalize_text(modified_match.group(1)) if modified_match else ""
+
+    return {
+        "revision_suggestions": revision_suggestions,
+        "modified_answer": modified_answer,
+        "raw_text": raw,
+        "is_valid": bool(revision_suggestions) and bool(modified_answer),
+    }
+
+
+def extract_messages(row: dict[str, Any]) -> tuple[str, str, str]:
+    messages = row.get("messages")
+    if not isinstance(messages, list):
+        return "", "", ""
+
+    system_content = ""
+    user_content = ""
+    assistant_content = ""
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = normalize_text(message.get("role")).lower()
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(
+                str(item.get("text", item)) if isinstance(item, dict) else str(item)
+                for item in content
+            )
+        content = str(content or "")
+        if role == "system" and not system_content:
+            system_content = content
+        elif role == "user" and not user_content:
+            user_content = content
+        elif role == "assistant" and not assistant_content:
+            assistant_content = content
+    return system_content, user_content, assistant_content
+
+
+def parse_labeled_sections(text: str) -> dict[str, str]:
+    matches: list[tuple[int, int, str]] = []
+    for key, pattern in SECTION_PATTERNS.items():
+        match = pattern.search(text or "")
+        if match:
+            matches.append((match.start(), match.end(), key))
+    matches.sort()
+
+    sections: dict[str, str] = {}
+    for index, (_, start_content, key) in enumerate(matches):
+        end_content = matches[index + 1][0] if index + 1 < len(matches) else len(text)
+        sections[key] = normalize_text(text[start_content:end_content])
+    return sections
+
+
+def enrich_sample_from_messages(sample: dict[str, Any]) -> dict[str, Any]:
+    _, user_content, assistant_content = extract_messages(sample)
+    if user_content:
+        sections = parse_labeled_sections(user_content)
+        for key, value in sections.items():
+            if value and not normalize_text(sample.get(key)):
+                sample[key] = value
+        if sections.get("evaluation_dimension") and not normalize_text(sample.get("dimension_name")):
+            sample["dimension_name"] = sections["evaluation_dimension"]
+        if sections.get("criteria") and not normalize_text(sample.get("criteria_text")):
+            sample["criteria_text"] = sections["criteria"]
+
+    if assistant_content:
+        parsed = parse_completion(assistant_content)
+        if parsed["revision_suggestions"] and not ChainCriticWeightedORM._extract_gt_revision_suggestions(sample):
+            sample["target_revision_suggestions"] = parsed["revision_suggestions"]
+        if parsed["modified_answer"] and not normalize_text(sample.get("target_modified_answer")):
+            sample["target_modified_answer"] = parsed["modified_answer"]
+
+    return sample
 
 
 def post_json(url: str, payload: dict[str, Any], api_key: str, timeout: float) -> dict[str, Any]:
@@ -126,33 +234,6 @@ def post_json(url: str, payload: dict[str, Any], api_key: str, timeout: float) -
     )
     with urllib_request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
-
-
-class OpenAICompatibleClient:
-    def __init__(self, base_url: str, model: str, api_key: str, timeout: float, retries: int, retry_sleep: float) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.api_key = api_key
-        self.timeout = timeout
-        self.retries = retries
-        self.retry_sleep = retry_sleep
-
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        if not texts:
-            return []
-        payload = {"model": self.model, "input": texts}
-        last_error: Optional[BaseException] = None
-        for attempt in range(self.retries + 1):
-            try:
-                response = post_json(f"{self.base_url}/embeddings", payload, self.api_key, self.timeout)
-                data = sorted(response.get("data") or [], key=lambda item: int(item.get("index", 0)))
-                embeddings = [item.get("embedding") for item in data]
-                if len(embeddings) == len(texts) and all(isinstance(item, list) for item in embeddings):
-                    return embeddings  # type: ignore[return-value]
-            except Exception as exc:
-                last_error = exc
-            time.sleep(self.retry_sleep * (attempt + 1))
-        raise RuntimeError(f"Embedding request failed: {last_error}")
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> Optional[float]:
@@ -172,19 +253,121 @@ def cosine_similarity(left: list[float], right: list[float]) -> Optional[float]:
     return dot / math.sqrt(left_norm * right_norm)
 
 
+def batched_cosine_diagonal(left_vectors: list[list[float]], right_vectors: list[list[float]]) -> list[Optional[float]]:
+    if len(left_vectors) != len(right_vectors):
+        raise ValueError("Embedding batch size mismatch.")
+    if not left_vectors:
+        return []
+
+    if np is None:
+        return [cosine_similarity(left, right) for left, right in zip(left_vectors, right_vectors)]
+
+    try:
+        left = np.asarray(left_vectors, dtype=np.float32)
+        right = np.asarray(right_vectors, dtype=np.float32)
+        if left.ndim != 2 or right.ndim != 2 or left.shape != right.shape:
+            return [cosine_similarity(lv, rv) for lv, rv in zip(left_vectors, right_vectors)]
+
+        left_norm = np.linalg.norm(left, axis=1, keepdims=True)
+        right_norm = np.linalg.norm(right, axis=1, keepdims=True)
+        valid = (left_norm[:, 0] > 0) & (right_norm[:, 0] > 0)
+        left = left / np.maximum(left_norm, 1e-12)
+        right = right / np.maximum(right_norm, 1e-12)
+        similarity_matrix = left @ right.T
+        diagonal = np.diag(similarity_matrix)
+        return [float(value) if bool(is_valid) else None for value, is_valid in zip(diagonal, valid)]
+    except Exception:
+        return [cosine_similarity(left, right) for left, right in zip(left_vectors, right_vectors)]
+
+
+def build_user_prompt(row: dict[str, Any]) -> str:
+    question = str(row.get("question", "")).strip()
+    answer = str(row.get("answer", "")).strip()
+    dimension = str(row.get("evaluation_dimension", "")).strip()
+    criteria = str(row.get("criteria", "")).strip()
+    revised = str(row.get("predicted_modified_answer", "")).strip()
+
+    return f"""Question:
+{question}
+
+Original Answer:
+{answer}
+
+Evaluation Dimension:
+{dimension}
+
+Score Criteria:
+{criteria}
+
+Revised Answer:
+{revised}
+
+Compare the Revised Answer against the Original Answer for this dimension only.
+Return exactly one label:
+BETTER
+SAME
+WORSE"""
+
+
+class OpenAICompatibleClient:
+    def __init__(self, base_url: str, model: str, api_key: str, timeout: float, retries: int, retry_sleep: float) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.timeout = timeout
+        self.retries = retries
+        self.retry_sleep = retry_sleep
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        payload = {"model": self.model, "input": texts}
+        response = self._post_with_retries(f"{self.base_url}/embeddings", payload)
+        data = sorted(response.get("data") or [], key=lambda item: int(item.get("index", 0)))
+        embeddings = [item.get("embedding") for item in data]
+        if len(embeddings) != len(texts) or not all(isinstance(item, list) for item in embeddings):
+            raise RuntimeError(f"Embedding count mismatch: expected {len(texts)}, got {len(embeddings)}")
+        return embeddings  # type: ignore[return-value]
+
+    def chat_label(self, system_prompt: str, user_prompt: str) -> str:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0,
+            "max_tokens": 4,
+        }
+        response = self._post_with_retries(f"{self.base_url}/chat/completions", payload)
+        choices = response.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        return normalize_text(message.get("content"))
+
+    def _post_with_retries(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        last_error: Optional[BaseException] = None
+        for attempt in range(self.retries + 1):
+            try:
+                return post_json(url, payload, self.api_key, self.timeout)
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    time.sleep(self.retry_sleep * (attempt + 1))
+        raise RuntimeError(f"Request failed for {url}: {last_error}")
+
+
 class ChainCriticWeightedORM(ORM):
     def __init__(self, args=None, **kwargs) -> None:
         super().__init__()
         self.args = args
-        
-        self.format_weight = env_float("CHAINCRITIC_FORMAT_WEIGHT", 0.10)
-        self.score_weight = env_float("CHAINCRITIC_SCORE_WEIGHT", 0.40)
-        self.reason_weight = env_float("CHAINCRITIC_REASON_WEIGHT", 0.20)
-        self.rewrite_weight = env_float("CHAINCRITIC_REWRITE_WEIGHT", 0.30)
+
+        self.rs_weight = env_float("CHAINCRITIC_RS_WEIGHT", 0.5)
+        self.verifier_weight = env_float("CHAINCRITIC_VERIFIER_WEIGHT", 0.5)
+        self.similarity_threshold = env_float("CHAINCRITIC_RS_SIMILARITY_THRESHOLD", 0.8)
         self.invalid_output_penalty = env_float("CHAINCRITIC_INVALID_OUTPUT_PENALTY", -1.0)
-        self.noop_rewrite_penalty = env_float("CHAINCRITIC_NOOP_REWRITE_PENALTY", 0.10)
-        self.verbosity_penalty = env_float("CHAINCRITIC_VERBOSITY_PENALTY", 0.05)
-        self.max_rewrite_ratio = env_float("CHAINCRITIC_MAX_REWRITE_RATIO", 3.0)
+        self.verifier_workers = env_int("CHAINCRITIC_VERIFIER_WORKERS", 8)
 
         api_key = os.getenv("CHAINCRITIC_API_KEY", os.getenv("OPENAI_API_KEY", "EMPTY"))
         timeout = env_float("CHAINCRITIC_REQUEST_TIMEOUT", 120.0)
@@ -198,13 +381,22 @@ class ChainCriticWeightedORM(ORM):
             retries,
             retry_sleep,
         )
+        self.verifier = OpenAICompatibleClient(
+            os.getenv("CHAINCRITIC_VERIFIER_BASE_URL", "http://127.0.0.1:8005/v1"),
+            os.getenv("CHAINCRITIC_VERIFIER_MODEL", ""),
+            api_key,
+            timeout,
+            retries,
+            retry_sleep,
+        )
+        self.gt_revision_embedding_cache: dict[str, list[float]] = {}
 
     def __call__(self, completions: list[Any], **kwargs: Any) -> list[float]:
         parsed_items = [parse_completion(completion) for completion in completions]
         samples = self._build_samples(kwargs, len(parsed_items))
-        score_rewards = [self._score_reward(item["score"], parse_int_score(sample.get("target_score"))) for item, sample in zip(parsed_items, samples)]
-        reason_rewards = self._reason_rewards(parsed_items, samples)
-        rewrite_rewards = self._rewrite_rewards(parsed_items, samples)
+
+        rs_rewards = self._revision_suggestion_rewards(parsed_items, samples)
+        verifier_rewards = self._verifier_rewards(parsed_items, samples)
 
         rewards: list[float] = []
         for index, parsed in enumerate(parsed_items):
@@ -212,22 +404,19 @@ class ChainCriticWeightedORM(ORM):
                 rewards.append(self.invalid_output_penalty)
                 continue
 
-            components = [(self.format_weight, self._format_reward(parsed))]
-            if score_rewards[index] is not None:
-                components.append((self.score_weight, float(score_rewards[index])))
-            if reason_rewards[index] is not None:
-                components.append((self.reason_weight, float(reason_rewards[index])))
-            if rewrite_rewards[index] is not None:
-                components.append((self.rewrite_weight, float(rewrite_rewards[index])))
+            components: list[tuple[float, float]] = []
+            if rs_rewards[index] is not None:
+                components.append((self.rs_weight, float(rs_rewards[index])))
+            if verifier_rewards[index] is not None:
+                components.append((self.verifier_weight, float(verifier_rewards[index])))
+
+            if not components:
+                rewards.append(self.invalid_output_penalty)
+                continue
 
             total_weight = sum(weight for weight, _ in components)
             reward = sum(weight * value for weight, value in components) / total_weight if total_weight > 0 else 0.0
-
-            if normalize_text(parsed["modified_answer"]) == normalize_text(samples[index].get("answer")):
-                reward -= self.noop_rewrite_penalty
-            if len(parsed["modified_answer"]) > max(1, len(str(samples[index].get("answer") or ""))) * self.max_rewrite_ratio:
-                reward -= self.verbosity_penalty
-            rewards.append(float(reward))
+            rewards.append(float(clamp01(reward)))
         return rewards
 
     @staticmethod
@@ -240,80 +429,116 @@ class ChainCriticWeightedORM(ORM):
                     sample[key] = value[index]
                 else:
                     sample[key] = value
+            sample = enrich_sample_from_messages(sample)
             samples.append(sample)
         return samples
 
-    @staticmethod
-    def _format_reward(parsed: dict[str, Any]) -> float:
-        lines = [line for line in parsed["raw_text"].splitlines() if line.strip()]
-        strict = [
-            len(lines) > 0 and lines[0].startswith("Score:"),
-            len(lines) > 1 and lines[1].startswith("Reason:"),
-            len(lines) > 2 and lines[2].startswith("Modified Answer:"),
-        ]
-        return 0.7 + 0.3 * (sum(1 for item in strict if item) / 3.0)
-
-    @staticmethod
-    def _score_reward(predicted: Optional[int], target: Optional[int]) -> Optional[float]:
-        if predicted is None or target is None:
-            return None
-        distance_term = 1.0 - abs(predicted - target) / 5.0
-        exact = 1.0 if predicted == target else 0.0
-        return clamp01(0.7 * distance_term + 0.3 * exact)
-
-    def _reason_rewards(self, parsed_items: list[dict[str, Any]], samples: list[dict[str, Any]]) -> list[Optional[float]]:
-        left_texts: list[str] = []
-        right_texts: list[str] = []
+    def _revision_suggestion_rewards(
+        self, parsed_items: list[dict[str, Any]], samples: list[dict[str, Any]]
+    ) -> list[Optional[float]]:
+        predicted_texts: list[str] = []
+        gt_texts: list[str] = []
         row_indices: list[int] = []
+        rewards: list[Optional[float]] = [None] * len(samples)
 
         for index, (parsed, sample) in enumerate(zip(parsed_items, samples)):
-            score = parsed["score"]
-            reason = parsed["reason"]
-            criterion = parse_criteria(sample.get("criteria_text")).get(str(score))
-            if score is None or not reason or not criterion:
+            predicted = parsed["revision_suggestions"]
+            gt_revision = self._extract_gt_revision_suggestions(sample)
+            if not predicted or not gt_revision:
                 continue
-            left_texts.append(reason)
-            right_texts.append(f"Score {score}: {criterion}")
+            predicted_texts.append(predicted)
+            gt_texts.append(gt_revision)
             row_indices.append(index)
 
-        rewards: list[Optional[float]] = [None] * len(samples)
-        if not left_texts:
+        if not predicted_texts:
             return rewards
 
-        similarities = self._embed_pair_similarities(left_texts, right_texts)
+        predicted_embeddings = self.embedding.embed(predicted_texts)
+        gt_embeddings = self._get_cached_gt_embeddings(gt_texts)
+        similarities = batched_cosine_diagonal(predicted_embeddings, gt_embeddings)
+
         for index, similarity in zip(row_indices, similarities):
             if similarity is not None:
-                rewards[index] = clamp01((similarity + 1.0) / 2.0)
+                rewards[index] = 1.0 if similarity >= self.similarity_threshold else 0.0
         return rewards
 
-    def _embed_pair_similarities(self, left_texts: list[str], right_texts: list[str]) -> list[Optional[float]]:
-        embeddings = self.embedding.embed(left_texts + right_texts)
-        split = len(left_texts)
-        return [cosine_similarity(left, right) for left, right in zip(embeddings[:split], embeddings[split:])]
+    def _get_cached_gt_embeddings(self, gt_texts: list[str]) -> list[list[float]]:
+        missing = []
+        seen = set()
+        for text in gt_texts:
+            if text not in self.gt_revision_embedding_cache and text not in seen:
+                missing.append(text)
+                seen.add(text)
 
-    def _rewrite_rewards(self, parsed_items: list[dict[str, Any]], samples: list[dict[str, Any]]) -> list[Optional[float]]:
-        left_texts: list[str] = []
-        right_texts: list[str] = []
-        row_indices: list[int] = []
+        if missing:
+            embeddings = self.embedding.embed(missing)
+            for text, embedding in zip(missing, embeddings):
+                self.gt_revision_embedding_cache[text] = embedding
+
+        return [self.gt_revision_embedding_cache[text] for text in gt_texts]
+
+    @staticmethod
+    def _extract_gt_revision_suggestions(sample: dict[str, Any]) -> str:
+        return first_non_empty(
+            sample.get("gt_revision_suggestions"),
+            sample.get("target_revision_suggestions"),
+            sample.get("reference_revision_suggestions"),
+            sample.get("revision_suggestions"),
+            sample.get("edit_intent"),
+            sample.get("target_edit_intent"),
+        )
+
+    def _verifier_rewards(
+        self, parsed_items: list[dict[str, Any]], samples: list[dict[str, Any]]
+    ) -> list[Optional[float]]:
         rewards: list[Optional[float]] = [None] * len(samples)
+        tasks: list[tuple[int, str]] = []
 
         for index, (parsed, sample) in enumerate(zip(parsed_items, samples)):
             modified_answer = parsed["modified_answer"]
-            gt_answer = normalize_text(sample.get("gt_answer") or sample.get("target_modified_answer"))
-            if not modified_answer or not gt_answer:
-                continue
-            left_texts.append(modified_answer)
-            right_texts.append(gt_answer)
-            row_indices.append(index)
+            question = first_non_empty(sample.get("question"), sample.get("prompt"), sample.get("instruction"))
+            original_answer = first_non_empty(sample.get("answer"), sample.get("candidate_answer"), sample.get("response"))
+            dimension = first_non_empty(sample.get("evaluation_dimension"), sample.get("dimension_name"), sample.get("name"))
+            criteria = first_non_empty(sample.get("criteria"), sample.get("criteria_text"), sample.get("score_criteria"))
 
-        if not left_texts:
+            if not modified_answer or not question or not original_answer or not dimension or not criteria:
+                continue
+
+            row = {
+                "question": question,
+                "answer": original_answer,
+                "evaluation_dimension": dimension,
+                "criteria": criteria,
+                "predicted_modified_answer": modified_answer,
+            }
+            tasks.append((index, build_user_prompt(row)))
+
+        if not tasks:
             return rewards
 
-        similarities = self._embed_pair_similarities(left_texts, right_texts)
-        for index, similarity in zip(row_indices, similarities):
-            if similarity is not None:
-                rewards[index] = clamp01((similarity + 1.0) / 2.0)
+        max_workers = max(1, min(self.verifier_workers, len(tasks)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self.verifier.chat_label, VERIFIER_SYSTEM_PROMPT, user_prompt): index
+                for index, user_prompt in tasks
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    label = self._parse_verifier_label(future.result())
+                except Exception:
+                    label = None
+                if label is None:
+                    continue
+                rewards[index] = 0.0 if label == "WORSE" else 1.0
+
         return rewards
+
+    @staticmethod
+    def _parse_verifier_label(text: Any) -> Optional[str]:
+        normalized = normalize_text(text).upper()
+        match = re.search(r"\b(BETTER|SAME|WORSE)\b", normalized)
+        return match.group(1) if match else None
 
 
 orms["chaincritic_weighted"] = ChainCriticWeightedORM
