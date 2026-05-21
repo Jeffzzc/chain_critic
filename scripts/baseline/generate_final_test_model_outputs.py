@@ -280,10 +280,15 @@ def load_completed_predictions(path: Path, *, resume_failed: bool) -> dict[str, 
     return completed
 
 
+# ================== 修改部分：支持多端口 ==================
 def build_base_urls(args: argparse.Namespace) -> list[str]:
     if args.base_url:
-        return [normalize_base_url(args.base_url)]
-    return [normalize_base_url(f"http://{args.host}:{args.port}/v1")]
+        # 如果使用逗号分隔多个 base_url，也能一并支持
+        return [normalize_base_url(url.strip()) for url in args.base_url.split(",")]
+    
+    # 遍历所有的 ports 构建多端点列表，实现负载均衡分发
+    return [normalize_base_url(f"http://{args.host}:{port}/v1") for port in args.ports]
+# =========================================================
 
 
 def resolve_api_key(args: argparse.Namespace) -> str:
@@ -488,13 +493,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default="", help="Name used in output filename and metadata. Defaults to model id.")
     parser.add_argument("--model", default="", help="Served model id. If omitted, fetched from /v1/models.")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--base-url", default="", help="OpenAI-compatible base URL, e.g. http://127.0.0.1:8000/v1.")
+    
+    # ================== 修改部分：支持多端口 ==================
+    # 将 `--port` 换为 `--ports`，并设置默认值为你刚才启动的四个端口
+    parser.add_argument(
+        "--ports", 
+        type=int, 
+        nargs="+", 
+        default=[8000, 8001, 8002, 8003], 
+        help="List of local ports for vLLM instances (e.g., --ports 8000 8001 8002 8003)."
+    )
+    # =========================================================
+
+    parser.add_argument("--base-url", default="", help="OpenAI-compatible base URL(s), comma-separated.")
     parser.add_argument("--api-key", default=DEFAULT_API_KEY)
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=2048)
-    parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--workers", type=int, default=96)
     parser.add_argument("--request-timeout", type=int, default=180)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-sleep", type=float, default=2.0)
