@@ -60,7 +60,9 @@ DEFAULT_REFERENCE = Path(
     "datasets/train/final_score_reason_plaintext_sft_final_tagged_system_user_balanced_v2/"
     "final_score_reason_plaintext_test.jsonl"
 )
+DEFAULT_PREDICTION_DIR = Path("evaluation/final_test_model_outputs")
 DEFAULT_OUTPUT_DIR = Path("evaluation/revision_suggestions_relevance")
+DEFAULT_PREDICTION_GLOB = "*.jsonl"
 
 COLON_CLASS = r"[:\uFF1A]"
 TAGGED_LABEL_RE = re.compile(
@@ -760,7 +762,13 @@ def discover_prediction_files(args: argparse.Namespace, generated_path: Optional
     if args.predictions:
         paths.extend(path.resolve() for path in args.predictions)
     if args.prediction_dir is not None:
-        paths.extend(sorted(path.resolve() for path in args.prediction_dir.glob("*.jsonl") if path.is_file()))
+        paths.extend(
+            sorted(
+                path.resolve()
+                for path in args.prediction_dir.glob(args.prediction_glob)
+                if path.is_file()
+            )
+        )
     if generated_path is not None:
         paths.append(generated_path.resolve())
 
@@ -782,7 +790,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--reference", type=Path, default=DEFAULT_REFERENCE, help="Tagged SFT test JSONL.")
     parser.add_argument("--predictions", nargs="*", type=Path, default=[], help="Existing prediction JSONL files.")
-    parser.add_argument("--prediction-dir", type=Path, default=None, help="Directory of existing prediction JSONL files.")
+    parser.add_argument(
+        "--prediction-dir",
+        type=Path,
+        default=DEFAULT_PREDICTION_DIR,
+        help=(
+            "Directory of existing prediction JSONL files. "
+            f"Default: {DEFAULT_PREDICTION_DIR}"
+        ),
+    )
+    parser.add_argument(
+        "--prediction-glob",
+        default=DEFAULT_PREDICTION_GLOB,
+        help=f"Glob used under --prediction-dir. Default: {DEFAULT_PREDICTION_GLOB}",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--limit", type=int, default=None, help="Optional row limit from the reference test set.")
     parser.add_argument("--overwrite", action="store_true")
@@ -805,7 +826,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--health-check-interval", type=float, default=2.0)
 
     parser.add_argument("--embedding-base-url-template", type=str, default=DEFAULT_BASE_URL_TEMPLATE)
-    parser.add_argument("--embedding-ports", nargs="*", default=["8000"], help="Embedding ports, e.g. 8000 or 8001-8004.")
+    parser.add_argument(
+        "--embedding-ports",
+        nargs="*",
+        default=["8000-8003"],
+        help="Embedding ports, e.g. 8000 or 8000-8003. Default: 8000-8003.",
+    )
     parser.add_argument("--embedding-model", type=str, default="", help="Embedding model id. Empty means fetch from /models.")
     parser.add_argument("--embedding-api-key", type=str, default=DEFAULT_API_KEY)
     parser.add_argument("--embedding-batch-size", type=int, default=64)
