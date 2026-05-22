@@ -81,7 +81,6 @@ TAGGED_LABEL_RE = re.compile(
     r"<rs>\s*(?P<revision>.*?)\s*</rs>\s*"
     r"<ra>\s*(?P<modified>.*?)\s*</ra>"
 )
-TAGGED_FIELD_RE = re.compile(r"(?is)<\s*(s|r|rs|ra)\s*>\s*(.*?)\s*</\s*\1\s*>")
 COLON_CLASS = r"[:\uFF1A]"
 SCORE_LINE_RE = re.compile(rf"(?im)^\s*score\s*{COLON_CLASS}\s*([0-5])\s*$")
 REASON_RE = re.compile(
@@ -140,27 +139,6 @@ def parse_label(text: str) -> dict[str, Any]:
         reason = normalize_text(tagged.group("reason"))
         revision = normalize_text(tagged.group("revision"))
         modified = normalize_text(tagged.group("modified"))
-        ok = score is not None and bool(reason) and bool(revision) and bool(modified)
-        return {
-            "score": score,
-            "reason": reason,
-            "revision_suggestions": revision,
-            "modified_answer": modified,
-            "raw_output": raw,
-            "parse_error": None if ok else "Tagged output is missing required fields.",
-            "tagged_ok": ok,
-            "strict_json_ok": False,
-        }
-
-    tagged_fields: dict[str, str] = {}
-    for match in TAGGED_FIELD_RE.finditer(raw):
-        tag = match.group(1).lower()
-        tagged_fields[tag] = match.group(2)
-    if tagged_fields:
-        score = parse_int_score(normalize_text(tagged_fields.get("s")))
-        reason = normalize_text(tagged_fields.get("r"))
-        revision = normalize_text(tagged_fields.get("rs"))
-        modified = normalize_text(tagged_fields.get("ra"))
         ok = score is not None and bool(reason) and bool(revision) and bool(modified)
         return {
             "score": score,
@@ -548,7 +526,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=1024)
-    parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--request-timeout", type=int, default=180)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-sleep", type=float, default=2.0)
