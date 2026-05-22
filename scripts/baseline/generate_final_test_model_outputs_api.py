@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate model outputs on the final tagged SFT test set.
+"""Generate model outputs on the final tagged SFT test set via external GPT API.
 
 The input JSONL is expected to contain OpenAI-style messages:
 
@@ -11,9 +11,9 @@ The input JSONL is expected to contain OpenAI-style messages:
   ]
 }
 
-For each row, this script sends only the system/user messages to a local
-OpenAI-compatible endpoint, parses the model output, and writes reference_*
-and predicted_* fields for downstream evaluation.
+For each row, this script sends only the system/user messages to an
+OpenAI-compatible API endpoint, parses the model output, and writes
+reference_* and predicted_* fields for downstream evaluation.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import re
 import sys
 import threading
 import time
-from typing import Any, Optional
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,17 +36,16 @@ EVAL_PIPELINE_DIR = ROOT / "scripts" / "evaluation_pipeline"
 sys.path.insert(0, str(EVAL_PIPELINE_DIR))
 
 from pipeline_common import (  # noqa: E402
-    DEFAULT_API_KEY,
     append_jsonl,
     call_chat_with_retries,
     extract_json_object,
     extract_sections_by_headers,
     fetch_model_id,
+    is_loopback_url,
     load_jsonl,
     normalize_text,
     parse_int_score,
     safe_unlink,
-    wait_for_servers,
     write_jsonl,
 )
 
@@ -70,12 +69,19 @@ DEFAULT_INPUT = Path(
 )
 DEFAULT_OUTPUT_DIR = Path("evaluation/final_test_model_outputs")
 
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_MODEL_ENV = "OPENAI_MODEL"
+DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"
+DEFAULT_OPENAI_BEARER_TOKEN_ENV = "OPENAI_BEARER_TOKEN"
+DEFAULT_BASE_URL_ENV = "OPENAI_BASE_URL"
+
 TAGGED_LABEL_RE = re.compile(
     r"(?is)<s>\s*(?P<score>.*?)\s*</s>\s*"
     r"<r>\s*(?P<reason>.*?)\s*</r>\s*"
     r"<rs>\s*(?P<revision>.*?)\s*</rs>\s*"
     r"<ra>\s*(?P<modified>.*?)\s*</ra>"
 )
+TAGGED_FIELD_RE = re.compile(r"(?is)<\s*(s|r|rs|ra)\s*>\s*(.*?)\s*</\s*\1\s*>")
 COLON_CLASS = r"[:\uFF1A]"
 SCORE_LINE_RE = re.compile(rf"(?im)^\s*score\s*{COLON_CLASS}\s*([0-5])\s*$")
 REASON_RE = re.compile(
@@ -117,14 +123,12 @@ def normalize_api_key(value: str) -> str:
     return token
 
 
-def parse_chat_template_kwargs(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise argparse.ArgumentTypeError(f"Invalid JSON for --chat-template-kwargs: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise argparse.ArgumentTypeError("--chat-template-kwargs must be a JSON object.")
-    return parsed
+def first_non_empty(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def parse_label(text: str) -> dict[str, Any]:
@@ -136,6 +140,27 @@ def parse_label(text: str) -> dict[str, Any]:
         reason = normalize_text(tagged.group("reason"))
         revision = normalize_text(tagged.group("revision"))
         modified = normalize_text(tagged.group("modified"))
+        ok = score is not None and bool(reason) and bool(revision) and bool(modified)
+        return {
+            "score": score,
+            "reason": reason,
+            "revision_suggestions": revision,
+            "modified_answer": modified,
+            "raw_output": raw,
+            "parse_error": None if ok else "Tagged output is missing required fields.",
+            "tagged_ok": ok,
+            "strict_json_ok": False,
+        }
+
+    tagged_fields: dict[str, str] = {}
+    for match in TAGGED_FIELD_RE.finditer(raw):
+        tag = match.group(1).lower()
+        tagged_fields[tag] = match.group(2)
+    if tagged_fields:
+        score = parse_int_score(normalize_text(tagged_fields.get("s")))
+        reason = normalize_text(tagged_fields.get("r"))
+        revision = normalize_text(tagged_fields.get("rs"))
+        modified = normalize_text(tagged_fields.get("ra"))
         ok = score is not None and bool(reason) and bool(revision) and bool(modified)
         return {
             "score": score,
@@ -290,36 +315,50 @@ def load_completed_predictions(path: Path, *, resume_failed: bool) -> dict[str, 
     return completed
 
 
-# ================== 修改部分：支持多端口 ==================
-def build_base_urls(args: argparse.Namespace) -> list[str]:
-    if args.base_url:
-        # 如果使用逗号分隔多个 base_url，也能一并支持
-        return [normalize_base_url(url.strip()) for url in args.base_url.split(",")]
-    
-    # 遍历所有的 ports 构建多端点列表，实现负载均衡分发
-    return [normalize_base_url(f"http://{args.host}:{port}/v1") for port in args.ports]
-# =========================================================
+def parse_base_urls(raw: str) -> list[str]:
+    cleaned = str(raw or "").strip()
+    if not cleaned:
+        return [normalize_base_url(DEFAULT_BASE_URL)]
+    return [normalize_base_url(value) for value in cleaned.split(",") if value.strip()]
 
 
 def resolve_api_key(args: argparse.Namespace) -> str:
     explicit = normalize_api_key(args.api_key)
-    if explicit and explicit != DEFAULT_API_KEY:
+    if explicit:
         return explicit
     env_token = normalize_api_key(os.getenv(args.api_key_env, ""))
-    return env_token or explicit or DEFAULT_API_KEY
+    if env_token:
+        return env_token
+    fallback = normalize_api_key(os.getenv(DEFAULT_OPENAI_BEARER_TOKEN_ENV, ""))
+    if fallback:
+        return fallback
+    raise ValueError(
+        f"Missing API key. Pass --api-key or set env {args.api_key_env} (or {DEFAULT_OPENAI_BEARER_TOKEN_ENV})."
+    )
+
+
+def resolve_model(args: argparse.Namespace, base_urls: list[str]) -> str:
+    model = first_non_empty(args.model, os.getenv(DEFAULT_MODEL_ENV, ""))
+    if model:
+        return model
+    if base_urls and is_loopback_url(base_urls[0]):
+        resolved = fetch_model_id(base_urls[0], args.health_check_timeout)
+        if resolved:
+            return resolved
+    raise ValueError(f"Missing --model (or env {DEFAULT_MODEL_ENV}).")
 
 
 def resolve_runtime(args: argparse.Namespace) -> tuple[list[str], str, str]:
-    base_urls = build_base_urls(args)
+    raw_base_url = first_non_empty(args.base_url, os.getenv(DEFAULT_BASE_URL_ENV, ""), DEFAULT_BASE_URL)
+    base_urls = parse_base_urls(raw_base_url)
     api_key = resolve_api_key(args)
-    if not args.skip_health_check:
+
+    if args.health_check and base_urls and is_loopback_url(base_urls[0]):
+        from pipeline_common import wait_for_servers  # lazy import
+
         wait_for_servers(base_urls, args.health_check_timeout, args.health_check_interval)
 
-    model = args.model.strip()
-    if not model:
-        model = fetch_model_id(base_urls[0], args.health_check_timeout)
-    if not model:
-        raise ValueError("No --model was provided and no model id could be fetched from /models.")
+    model = resolve_model(args, base_urls)
     return base_urls, api_key, model
 
 
@@ -384,7 +423,6 @@ def run_one(
             timeout_seconds=args.request_timeout,
             retries=args.retries,
             retry_sleep=args.retry_sleep,
-            chat_template_kwargs=args.chat_template_kwargs,
         )
         parsed = parse_label(raw_text)
         ok = (
@@ -453,7 +491,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"[samples] total={len(samples)} completed={len(completed)} pending={len(pending)}")
 
     lock = threading.Lock()
-    progress = tqdm(total=len(pending), desc="final_test_generate", ncols=100) if tqdm is not None else None
+    progress = tqdm(total=len(pending), desc="final_test_generate_api", ncols=100) if tqdm is not None else None
     try:
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
             futures = {
@@ -496,38 +534,21 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate outputs for different local models on the final tagged test set."
+        description="Generate GPT outputs for the final tagged test set via an external API."
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT, help=f"Input JSONL. Default: {DEFAULT_INPUT}")
     parser.add_argument("--output", type=Path, default=None, help="Output JSONL. Defaults to output-dir/run-name file.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--run-name", default="", help="Name used in output filename and metadata. Defaults to model id.")
-    parser.add_argument("--model", default="", help="Served model id. If omitted, fetched from /v1/models.")
-    parser.add_argument("--host", default="127.0.0.1")
-    
-    # ================== 修改部分：支持多端口 ==================
-    # 将 `--port` 换为 `--ports`，并设置默认值为你刚才启动的四个端口
-    parser.add_argument(
-        "--ports", 
-        type=int, 
-        nargs="+", 
-        default=[8000, 8001, 8002, 8003], 
-        help="List of local ports for vLLM instances (e.g., --ports 8000 8001 8002 8003)."
-    )
-    # =========================================================
+    parser.add_argument("--run-name", default="", help="Name used in output filename and metadata. Defaults to model.")
+    parser.add_argument("--model", default="", help=f"API model id. Falls back to env {DEFAULT_MODEL_ENV}.")
 
     parser.add_argument("--base-url", default="", help="OpenAI-compatible base URL(s), comma-separated.")
-    parser.add_argument("--api-key", default=DEFAULT_API_KEY)
-    parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
+    parser.add_argument("--api-key", default="", help="Explicit API key (bearer token).")
+    parser.add_argument("--api-key-env", default=DEFAULT_API_KEY_ENV)
+
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=1024)
-    parser.add_argument(
-        "--chat-template-kwargs",
-        type=parse_chat_template_kwargs,
-        default={"enable_thinking": False},
-        help='JSON object passed to vLLM chat_template_kwargs. Default: {"enable_thinking": false}',
-    )
-    parser.add_argument("--workers", type=int, default=96)
+    parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--request-timeout", type=int, default=180)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-sleep", type=float, default=2.0)
@@ -535,7 +556,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true", help="Delete existing output before running.")
     parser.add_argument("--resume-failed", action="store_true", help="Also skip existing failed rows when resuming.")
     parser.add_argument("--reorder", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--skip-health-check", action="store_true")
+
+    parser.add_argument("--health-check", action="store_true", help="Enable /models health check for loopback URLs.")
     parser.add_argument("--health-check-timeout", type=int, default=10)
     parser.add_argument("--health-check-interval", type=float, default=2.0)
     return parser.parse_args()

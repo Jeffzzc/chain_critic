@@ -180,6 +180,7 @@ def post_chat_completion(
     temperature: float,
     max_tokens: int,
     timeout_seconds: int,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
@@ -188,6 +189,8 @@ def post_chat_completion(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if chat_template_kwargs:
+        payload["chat_template_kwargs"] = chat_template_kwargs
     req = urllib_request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -302,6 +305,7 @@ def call_chat_with_retries(
     timeout_seconds: int,
     retries: int,
     retry_sleep: float,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     last_error: Exception | None = None
     endpoint_count = max(1, len(base_urls))
@@ -316,6 +320,7 @@ def call_chat_with_retries(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout_seconds=timeout_seconds,
+                chat_template_kwargs=chat_template_kwargs,
             )
             return text, base_url
         except Exception as exc:
