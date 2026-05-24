@@ -41,6 +41,7 @@ from pipeline_common import (
     build_base_urls,
     cosine_similarity,
     embed_texts_with_retries,
+    iter_jsonl,
     load_jsonl,
     normalize_text,
     parse_ports,
@@ -309,10 +310,26 @@ def resolve_sample_for_prediction(
     return samples_by_index.get(fallback_index)
 
 
-def build_metric_rows(prediction_path: Path, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def normalized_selector(text: str) -> str:
+    return str(text or "").strip().strip("\"'").replace("\\", "/").lower()
+
+
+def positive_limit(value: Optional[int]) -> Optional[int]:
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+def build_metric_rows(
+    prediction_path: Path,
+    samples: list[dict[str, Any]],
+    sample_size: Optional[int],
+) -> list[dict[str, Any]]:
     samples_by_id, samples_by_index = sample_maps(samples)
     rows: list[dict[str, Any]] = []
-    for fallback_index, prediction in enumerate(load_jsonl(prediction_path)):
+    for fallback_index, prediction in enumerate(iter_jsonl(prediction_path)):
+        if sample_size is not None and fallback_index >= sample_size:
+            break
         sample = resolve_sample_for_prediction(prediction, fallback_index, samples_by_id, samples_by_index)
         row: dict[str, Any] = {
             "sample_id": normalize_text(prediction.get("sample_id")) or None,
@@ -619,7 +636,7 @@ def process_prediction_file(
     base_urls: list[str],
     model: str,
 ) -> dict[str, Any]:
-    rows = build_metric_rows(prediction_path, samples)
+    rows = build_metric_rows(prediction_path, samples, positive_limit(args.sample_size))
     fill_sentence_metrics(
         rows,
         executor=executor,
@@ -647,10 +664,61 @@ def is_discoverable_prediction_file(path: Path, root: Path) -> bool:
     return not (relative_parts & EXCLUDED_DISCOVERY_DIRS)
 
 
+def selector_matches_prediction(path: Path, selector: str, root: Optional[Path]) -> bool:
+    target = normalized_selector(selector)
+    if not target:
+        return False
+
+    candidates = {
+        normalized_selector(path.name),
+        normalized_selector(path.stem),
+        normalized_selector(str(path)),
+        normalized_selector(str(path.resolve())),
+    }
+    if root is not None:
+        try:
+            candidates.add(normalized_selector(str(path.relative_to(root))))
+        except ValueError:
+            pass
+
+    return target in candidates or any(target in candidate for candidate in candidates)
+
+
+def apply_prediction_file_selectors(
+    paths: list[Path],
+    selectors: list[str],
+    root: Optional[Path],
+) -> list[Path]:
+    if not selectors:
+        return paths
+
+    selected: list[Path] = []
+    unmatched: list[str] = []
+    for selector in selectors:
+        selector_path = Path(selector).expanduser()
+        if selector_path.is_file():
+            selected.append(selector_path.resolve())
+            continue
+
+        matches = [path for path in paths if selector_matches_prediction(path, selector, root)]
+        if matches:
+            selected.extend(matches)
+        else:
+            unmatched.append(selector)
+
+    if unmatched:
+        raise FileNotFoundError(
+            "No prediction file matched --prediction-file selector(s): "
+            + ", ".join(repr(item) for item in unmatched)
+        )
+    return selected
+
+
 def discover_prediction_files(args: argparse.Namespace) -> list[Path]:
     paths: list[Path] = []
     if args.predictions:
         paths.extend(path.resolve() for path in args.predictions)
+    root: Optional[Path] = None
     if args.prediction_dir is not None:
         root = args.prediction_dir.resolve()
         if not root.is_dir():
@@ -661,6 +729,7 @@ def discover_prediction_files(args: argparse.Namespace) -> list[Path]:
             for path in globber(args.prediction_glob)
             if is_discoverable_prediction_file(path, root)
         )
+    paths = apply_prediction_file_selectors(paths, args.prediction_file, root)
 
     deduped: list[Path] = []
     seen: set[Path] = set()
@@ -736,6 +805,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference", type=Path, default=DEFAULT_REFERENCE, help="Tagged SFT test JSONL.")
     parser.add_argument("--predictions", nargs="*", type=Path, default=[], help="Explicit prediction JSONL files.")
     parser.add_argument(
+        "--prediction-file",
+        "--file",
+        action="append",
+        default=[],
+        help=(
+            "Run only matching prediction file(s). Accepts a full path, file name, stem, "
+            "or substring under --prediction-dir. Can be passed multiple times."
+        ),
+    )
+    parser.add_argument(
         "--prediction-dir",
         type=Path,
         default=DEFAULT_PREDICTION_DIR,
@@ -744,7 +823,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prediction-glob", default=DEFAULT_PREDICTION_GLOB)
     parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--limit", type=int, default=None, help="Optional row limit from the reference test set.")
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=10000,
+        help="Rows sampled from the start of each prediction file. Use <=0 to process all rows. Default: 10000.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional reference row limit. If omitted, defaults to --sample-size.",
+    )
     parser.add_argument("--overwrite", action="store_true")
 
     parser.add_argument("--embedding-base-url-template", type=str, default=DEFAULT_BASE_URL_TEMPLATE)
@@ -775,7 +865,9 @@ def main() -> None:
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    samples = load_reference_samples(args.reference.resolve(), args.limit)
+    sample_size = positive_limit(args.sample_size)
+    reference_limit = positive_limit(args.limit) if args.limit is not None else sample_size
+    samples = load_reference_samples(args.reference.resolve(), reference_limit)
     if not samples:
         raise FileNotFoundError(f"No reference samples loaded from {args.reference}")
     print(f"[reference] {args.reference.resolve()} samples={len(samples)}")
@@ -793,6 +885,7 @@ def main() -> None:
     embedding_model = args.embedding_model.strip() or resolve_model("", embedding_base_urls, args.health_check_timeout)
 
     print(f"[prediction_files] {len(prediction_files)}")
+    print(f"[sample_size] {sample_size if sample_size is not None else 'all'}")
     print(f"[output_dir] {args.output_dir}")
     print(f"[embedding_model] {embedding_model}")
     print(f"[embedding_base_urls] {embedding_base_urls}")
