@@ -40,6 +40,7 @@ DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL_ENV = "OPENAI_MODEL"
 DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"
 DEFAULT_BASE_URL_ENV = "OPENAI_BASE_URL"
+DEFAULT_API_MODE = "auto"
 
 COLON_CLASS = r"[:\uFF1A]"
 TAGGED_LABEL_RE = re.compile(
@@ -173,6 +174,7 @@ def build_messages(sample: Dict[str, Any]) -> List[Dict[str, str]]:
         "Output plain text in exactly 1 line using these tags and no numbering:\n"
         "<s>score</s><r>reason</r><rs>revision suggestions</rs><ra>refined answer</ra>\n"
         "Do not include any extra text, JSON, markdown, bullets, or line breaks inside any field."
+        "Keep <r> under 80 words, <rs> under 50 words, and <ra> under 90 words."
     )
     user = "\n".join(
         [
@@ -276,7 +278,8 @@ def parse_output(text: str) -> Dict[str, Any]:
 
     parsed = extract_json_object(raw)
     if isinstance(parsed, dict):
-        score = parse_int_score(parsed.get("score") or parsed.get("Score"))
+        score_value = parsed["score"] if "score" in parsed else parsed.get("Score")
+        score = parse_int_score(score_value)
         reason = normalize_text(parsed.get("reason") or parsed.get("Reason"))
         revision = normalize_text(
             parsed.get("revision_suggestions")
@@ -331,18 +334,78 @@ def parse_output(text: str) -> Dict[str, Any]:
 
 
 def extract_text_from_response(payload: Dict[str, Any]) -> str:
+    """Extract visible assistant text from common OpenAI-compatible responses."""
+
+    def content_to_text(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = (
+                        item.get("text")
+                        or item.get("content")
+                        or item.get("output_text")
+                    )
+                    if text:
+                        parts.append(str(text))
+            return "\n".join(parts).strip()
+        return str(content).strip()
+
     choices = payload.get("choices") or []
     if choices:
         first = choices[0]
         if isinstance(first, dict):
             message = first.get("message")
             if isinstance(message, dict):
-                return str(message.get("content") or "").strip()
-            if isinstance(first.get("text"), str):
-                return str(first.get("text") or "").strip()
-    if isinstance(payload.get("text"), str):
-        return str(payload.get("text") or "").strip()
-    return str(payload)
+                # Prefer normal visible answer.
+                for key in ["content", "output_text"]:
+                    text = content_to_text(message.get(key))
+                    if text:
+                        return text
+
+                # Some reasoning-model proxies put text here.
+                # Only use this as fallback, because it may contain hidden reasoning
+                # rather than the final answer.
+                for key in ["reasoning_content", "reasoning", "thought"]:
+                    text = content_to_text(message.get(key))
+                    if text:
+                        return text
+
+            text = content_to_text(first.get("text"))
+            if text:
+                return text
+
+            text = content_to_text(first.get("delta", {}).get("content") if isinstance(first.get("delta"), dict) else "")
+            if text:
+                return text
+
+    for key in ["text", "output_text", "content"]:
+        text = content_to_text(payload.get(key))
+        if text:
+            return text
+
+    output_text = content_to_text(payload.get("output_text"))
+    if output_text:
+        return output_text
+
+    output = payload.get("output")
+    if isinstance(output, list):
+        parts: List[str] = []
+        for item in output:
+            if isinstance(item, dict):
+                text = content_to_text(item.get("content") or item.get("output_text") or item.get("text"))
+                if text:
+                    parts.append(text)
+        if parts:
+            return "\n".join(parts).strip()
+
+    return ""
 
 
 def post_chat_completion(
@@ -377,6 +440,93 @@ def post_chat_completion(
     return response.json()
 
 
+def post_responses(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    timeout: int,
+) -> Dict[str, Any]:
+    import requests
+
+    payload = {
+        "model": model,
+        "input": messages,
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
+        "response_format": {"type": "text"},
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    response = requests.post(
+        base_url.rstrip("/") + "/responses",
+        json=payload,
+        headers=headers,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def post_completion(
+    *,
+    api_mode: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    timeout: int,
+) -> Dict[str, Any]:
+    if api_mode == "responses":
+        return post_responses(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+    if api_mode == "chat":
+        return post_chat_completion(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+
+    payload = post_chat_completion(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=timeout,
+    )
+    if extract_text_from_response(payload):
+        return payload
+    return post_responses(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=timeout,
+    )
+
+
 def call_api_with_retries(
     *,
     base_urls: List[str],
@@ -389,13 +539,15 @@ def call_api_with_retries(
     timeout: int,
     retries: int,
     retry_sleep: float,
+    api_mode: str,
 ) -> Tuple[Dict[str, Any], str]:
     last_error: Optional[Exception] = None
     for attempt in range(retries + 1):
         endpoint = base_urls[(task_index + attempt) % len(base_urls)]
         try:
             return (
-                post_chat_completion(
+                post_completion(
+                    api_mode=api_mode,
                     base_url=endpoint,
                     api_key=api_key,
                     model=model,
@@ -478,6 +630,7 @@ def run_one(
             timeout=args.timeout,
             retries=args.retries,
             retry_sleep=args.retry_sleep,
+            api_mode=args.api_mode,
         )
         raw_text = extract_text_from_response(response_payload)
         parsed = parse_output(raw_text)
@@ -626,12 +779,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-env", default=DEFAULT_MODEL_ENV)
     parser.add_argument("--api-key", default="", help="Explicit API key.")
     parser.add_argument("--api-key-env", default=DEFAULT_API_KEY_ENV)
+    parser.add_argument(
+        "--api-mode",
+        choices=["auto", "chat", "responses"],
+        default=DEFAULT_API_MODE,
+        help="API mode to use. auto tries chat first, then responses if empty.",
+    )
 
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-sleep", type=float, default=2.0)
     parser.add_argument("--flush-every", type=int, default=20)
