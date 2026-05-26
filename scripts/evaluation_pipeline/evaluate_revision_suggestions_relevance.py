@@ -178,6 +178,56 @@ def split_messages(record: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
     return prompt_messages, assistant_contents[-1]
 
 
+def reference_from_prediction_style_row(record: dict[str, Any]) -> dict[str, Any]:
+    revision = normalize_text(
+        record.get("reference_revision_suggestions")
+        or record.get("predicted_revision_suggestions")
+        or record.get("revision_suggestions")
+        or record.get("target_revision_suggestions")
+        or record.get("edit_intent")
+        or record.get("predicted_edit_intent")
+    )
+    score = parse_int_score(
+        record.get("reference_score")
+        if "reference_score" in record
+        else record.get("predicted_score")
+        if "predicted_score" in record
+        else record.get("score")
+    )
+    reason = normalize_text(record.get("reference_reason") or record.get("predicted_reason") or record.get("reason"))
+    modified = normalize_text(
+        record.get("reference_modified_answer")
+        or record.get("predicted_modified_answer")
+        or record.get("modified_answer")
+    )
+
+    raw_output = normalize_text(record.get("raw_output"))
+    parse_error = None
+    if raw_output and (score is None or not revision):
+        parsed = parse_label(raw_output)
+        if score is None:
+            score = parsed.get("score")
+        if not reason:
+            reason = normalize_text(parsed.get("reason"))
+        if not revision:
+            revision = normalize_text(parsed.get("revision_suggestions"))
+        if not modified:
+            modified = normalize_text(parsed.get("modified_answer"))
+        parse_error = parsed.get("parse_error")
+
+    if not revision:
+        parse_error = parse_error or "missing reference revision_suggestions"
+
+    return {
+        "score": score,
+        "reason": reason,
+        "revision_suggestions": revision,
+        "modified_answer": modified,
+        "raw_output": raw_output,
+        "parse_error": parse_error,
+    }
+
+
 def parse_label(text: str) -> dict[str, Any]:
     raw = str(text or "").strip().replace("\r\n", "\n")
     tagged = TAGGED_LABEL_RE.search(raw)
@@ -258,13 +308,22 @@ def load_reference_samples(path: Path, limit: Optional[int]) -> list[dict[str, A
 
     samples: list[dict[str, Any]] = []
     for index, record in enumerate(records):
-        prompt_messages, reference_output = split_messages(record)
-        reference = parse_label(reference_output)
+        messages = record.get("messages")
+        if isinstance(messages, list):
+            prompt_messages, reference_output = split_messages(record)
+            reference = parse_label(reference_output)
+        else:
+            prompt_messages = []
+            reference = reference_from_prediction_style_row(record)
+            reference_output = reference["raw_output"]
         samples.append(
             {
                 "sample_id": stable_sample_id(record, index),
                 "index": index,
                 "prompt_messages": prompt_messages,
+                "question": record.get("question") or record.get("orig_instruction"),
+                "answer": record.get("answer") or record.get("orig_response"),
+                "dimension_name": record.get("dimension_name") or record.get("evaluation_dimension") or record.get("orig_criteria"),
                 "reference_output": reference_output,
                 "reference_score": reference["score"],
                 "reference_reason": reference["reason"],

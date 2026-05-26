@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -281,7 +282,69 @@ def reference_field_from_sample(sample: dict[str, Any], prediction: dict[str, An
 def load_reference_samples(path: Path, limit: Optional[int]) -> list[dict[str, Any]]:
     from evaluate_revision_suggestions_relevance import load_reference_samples as load_samples
 
-    return load_samples(path, limit)
+    samples = load_samples(path, limit)
+    records = load_jsonl(path)
+    if limit is not None:
+        records = records[: max(0, limit)]
+
+    for sample, record in zip(samples, records):
+        if not normalize_text(sample.get("reference_reason")):
+            sample["reference_reason"] = normalize_text(
+                record.get("reference_reason")
+                or record.get("predicted_reason")
+                or record.get("reason")
+                or record.get("orig_feedback")
+                or record.get("feedback")
+            )
+        if not normalize_text(sample.get("reference_revision_suggestions")):
+            sample["reference_revision_suggestions"] = normalize_text(
+                record.get("reference_revision_suggestions")
+                or record.get("predicted_revision_suggestions")
+                or record.get("revision_suggestions")
+                or record.get("target_revision_suggestions")
+                or record.get("edit_intent")
+            )
+        if sample.get("reference_score") is None:
+            sample["reference_score"] = record.get("reference_score") or record.get("predicted_score") or record.get("score") or record.get("orig_score")
+    return samples
+
+
+def coalesce_text(row: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        text = normalize_text(row.get(key))
+        if text:
+            return text
+    return ""
+
+
+def content_key(row: dict[str, Any]) -> Optional[str]:
+    question = coalesce_text(row, "question", "orig_instruction", "instruction")
+    answer = coalesce_text(row, "answer", "orig_response", "response")
+    dimension = coalesce_text(row, "dimension_name", "evaluation_dimension", "orig_criteria", "criteria")
+    if not (question and answer and dimension):
+        return None
+    raw = json.dumps(
+        {
+            "question": question,
+            "answer": answer,
+            "dimension": dimension,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def sample_maps_by_key(
+    samples: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[int, dict[str, Any]], dict[str, dict[str, Any]]]:
+    samples_by_id, samples_by_index = sample_maps(samples)
+    samples_by_content: dict[str, dict[str, Any]] = {}
+    for sample in samples:
+        key = content_key(sample)
+        if key and key not in samples_by_content:
+            samples_by_content[key] = sample
+    return samples_by_id, samples_by_index, samples_by_content
 
 
 def resolve_sample_for_prediction(
@@ -289,7 +352,12 @@ def resolve_sample_for_prediction(
     fallback_index: int,
     samples_by_id: dict[str, dict[str, Any]],
     samples_by_index: dict[int, dict[str, Any]],
+    samples_by_content: Optional[dict[str, dict[str, Any]]] = None,
 ) -> Optional[dict[str, Any]]:
+    key = content_key(row)
+    if key and samples_by_content is not None and key in samples_by_content:
+        return samples_by_content[key]
+
     sample_id = normalize_text(row.get("sample_id"))
     if sample_id and sample_id in samples_by_id:
         return samples_by_id[sample_id]
@@ -325,12 +393,18 @@ def build_metric_rows(
     samples: list[dict[str, Any]],
     sample_size: Optional[int],
 ) -> list[dict[str, Any]]:
-    samples_by_id, samples_by_index = sample_maps(samples)
+    samples_by_id, samples_by_index, samples_by_content = sample_maps_by_key(samples)
     rows: list[dict[str, Any]] = []
     for fallback_index, prediction in enumerate(iter_jsonl(prediction_path)):
         if sample_size is not None and fallback_index >= sample_size:
             break
-        sample = resolve_sample_for_prediction(prediction, fallback_index, samples_by_id, samples_by_index)
+        sample = resolve_sample_for_prediction(
+            prediction,
+            fallback_index,
+            samples_by_id,
+            samples_by_index,
+            samples_by_content,
+        )
         row: dict[str, Any] = {
             "sample_id": normalize_text(prediction.get("sample_id")) or None,
             "index": prediction.get("index", fallback_index),

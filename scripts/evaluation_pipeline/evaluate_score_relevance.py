@@ -1,10 +1,11 @@
 #!/usr/bin/env python
-"""Evaluate predicted_score correlation against a cortex-5 baseline."""
+"""Evaluate predicted_score correlation against a baseline or ground-truth scores."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import time
@@ -17,6 +18,14 @@ from pipeline_common import load_jsonl, normalize_text
 DEFAULT_INPUT_DIR = Path("datasets/MATH500/final")
 DEFAULT_OUTPUT_DIR = Path("datasets/MATH500/score_relevance")
 DEFAULT_BASELINE_HINT = "cortex-5"
+
+
+def coalesce_text(row: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        text = normalize_text(row.get(key))
+        if text:
+            return text
+    return ""
 
 
 def format_float(value: Optional[float]) -> Optional[float]:
@@ -124,6 +133,21 @@ def as_finite_float(value: Any) -> Optional[float]:
 
 
 def row_key(row: dict[str, Any]) -> tuple[str, Any]:
+    question = coalesce_text(row, "question", "orig_instruction", "instruction")
+    answer = coalesce_text(row, "answer", "orig_response", "response")
+    dimension = coalesce_text(row, "dimension_name", "evaluation_dimension", "orig_criteria", "criteria")
+    if question and answer and dimension:
+        raw = json.dumps(
+            {
+                "question": question,
+                "answer": answer,
+                "dimension": dimension,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return ("content", hashlib.sha1(raw.encode("utf-8")).hexdigest())
+
     sample_id = normalize_text(row.get("sample_id"))
     if sample_id:
         return ("sample_id", sample_id)
@@ -146,20 +170,29 @@ def row_key(row: dict[str, Any]) -> tuple[str, Any]:
 
 def sort_key(key: tuple[str, Any]) -> tuple[int, Any]:
     order = {
-        "sample_id": 0,
-        "unique_id_dimension": 1,
-        "parent_dimension": 2,
-        "index": 3,
+        "content": 0,
+        "sample_id": 1,
+        "unique_id_dimension": 2,
+        "parent_dimension": 3,
+        "index": 4,
     }
     return (order.get(key[0], 99), key[1])
 
 
+def score_from_row(row: dict[str, Any]) -> Optional[float]:
+    for key in ("predicted_score", "score", "reference_score", "orig_score"):
+        score = as_finite_float(row.get(key))
+        if score is not None:
+            return score
+    return None
+
+
 def row_quality_score(row: dict[str, Any]) -> tuple[int, int, int, int, int]:
-    predicted_score_ok = int(as_finite_float(row.get("predicted_score")) is not None)
+    predicted_score_ok = int(score_from_row(row) is not None)
     parse_ok = int(not row.get("parse_error"))
     request_ok = int(not row.get("request_error"))
-    question_ok = int(bool(normalize_text(row.get("question"))))
-    dimension_ok = int(bool(normalize_text(row.get("dimension_name") or row.get("evaluation_dimension"))))
+    question_ok = int(bool(coalesce_text(row, "question", "orig_instruction", "instruction")))
+    dimension_ok = int(bool(coalesce_text(row, "dimension_name", "evaluation_dimension", "orig_criteria", "criteria")))
     return (predicted_score_ok, parse_ok, request_ok, question_ok, dimension_ok)
 
 
@@ -188,19 +221,15 @@ def validate_aligned_rows(
     target_row: dict[str, Any],
     target_path: Path,
 ) -> None:
-    baseline_question = normalize_text(baseline_row.get("question"))
-    target_question = normalize_text(target_row.get("question"))
+    baseline_question = coalesce_text(baseline_row, "question", "orig_instruction")
+    target_question = coalesce_text(target_row, "question", "orig_instruction")
     if baseline_question and target_question and baseline_question != target_question:
         raise ValueError(
             f"Mismatched question for key={row_key(baseline_row)!r} in {target_path}"
         )
 
-    baseline_dimension = normalize_text(
-        baseline_row.get("dimension_name") or baseline_row.get("evaluation_dimension")
-    )
-    target_dimension = normalize_text(
-        target_row.get("dimension_name") or target_row.get("evaluation_dimension")
-    )
+    baseline_dimension = coalesce_text(baseline_row, "dimension_name", "evaluation_dimension", "orig_criteria")
+    target_dimension = coalesce_text(target_row, "dimension_name", "evaluation_dimension", "orig_criteria")
     if baseline_dimension and target_dimension and baseline_dimension != target_dimension:
         raise ValueError(
             f"Mismatched evaluation dimension for key={row_key(baseline_row)!r} in {target_path}"
@@ -258,8 +287,8 @@ def compare_prediction_file(
         target_row = target_rows[key]
         validate_aligned_rows(baseline_row, target_row, target_path)
 
-        baseline_score = as_finite_float(baseline_row.get("predicted_score"))
-        target_score = as_finite_float(target_row.get("predicted_score"))
+        baseline_score = score_from_row(baseline_row)
+        target_score = score_from_row(target_row)
 
         if baseline_score is None:
             baseline_missing_scores += 1
@@ -375,7 +404,7 @@ def write_correlation_summary(
         ),
     )
     payload = {
-        "baseline_prediction_file": str(baseline_path),
+        "baseline_or_ground_truth_file": str(baseline_path),
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "target_summaries": target_summaries,
         "ranking_by_spearman": [
@@ -458,8 +487,8 @@ def write_correlation_summary(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare predicted_score in MATH500-Bench final JSONL files against a cortex-5 baseline "
-            "and report Pearson/Spearman/Kendall correlations."
+            "Compare predicted_score JSONL files against a baseline prediction file or a ground-truth "
+            "JSONL with score/orig_score, then report Pearson/Spearman/Kendall correlations."
         )
     )
     parser.add_argument(
@@ -479,9 +508,15 @@ def parse_args() -> argparse.Namespace:
         "--baseline",
         default=DEFAULT_BASELINE_HINT,
         help=(
-            "Baseline file path or fuzzy name/stem. Default resolves to the cortex-5 file "
-            f"under {DEFAULT_INPUT_DIR}."
+            "Baseline/ground-truth file path or fuzzy name/stem. Rows may contain predicted_score, "
+            f"score, reference_score, or orig_score. Default resolves to the cortex-5 file under {DEFAULT_INPUT_DIR}."
         ),
+    )
+    parser.add_argument(
+        "--ground-truth",
+        type=Path,
+        default=None,
+        help="Alias for --baseline when comparing predictions against a GT JSONL such as Feedback-Bench train.jsonl.",
     )
     parser.add_argument(
         "--output-dir",
@@ -509,7 +544,9 @@ def main() -> None:
     if not input_dir.is_dir():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
 
-    baseline_path = resolve_baseline_path(input_dir, args.baseline)
+    baseline_path = args.ground_truth.resolve() if args.ground_truth is not None else resolve_baseline_path(input_dir, args.baseline)
+    if not baseline_path.is_file():
+        raise FileNotFoundError(f"Baseline/ground-truth file not found: {baseline_path}")
     input_paths = discover_input_paths(
         input_dir=input_dir,
         explicit_inputs=args.inputs,
